@@ -198,3 +198,20 @@ python quick_build.py "your request"
 ```
 
 **Post back once the test works!** Then we can add the alias and README for your Mac setup.
+
+## Custom cli tools 
+Where build() is whatever you want the command to be.
+
+```bash
+echo 'build() {
+  source ~/agent-env/bin/activate
+  python ~/quick_build.py "$@"
+}' >> ~/.zshrc
+
+source ~/.zshrc
+```
+
+Test it:
+```bash
+build "async task queue with retry logic"
+```
