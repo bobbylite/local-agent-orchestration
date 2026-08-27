@@ -2,21 +2,27 @@
 """Quick Question — local-first Q&A with a Claude safety net.
 
 A router picks the best local Ollama model for the request. A dedicated
-local judge model reviews the answer (LLM-as-judge) for up to two rounds.
+local judge model (Prometheus-2) reviews the answer for up to two rounds.
 If the judge still isn't satisfied, Claude Sonnet takes over. Every stage
 streams live and file writes always ask for permission first.
 """
 
 import argparse
+import asyncio
+import contextvars
 import re
 import sys
 import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import TypedDict
 
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
@@ -24,6 +30,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.rule import Rule
+from rich.status import Status
 from rich.syntax import Syntax
 
 WORKER_MODELS = {
@@ -31,7 +38,8 @@ WORKER_MODELS = {
     # never emits proper structured tool_calls (bare JSON text instead) and then
     # loops re-emitting the same call after seeing a tool result instead of
     # synthesizing an answer, which breaks the tool-using worker/escalate loop.
-    "qwen2.5:7b-instruct": "general reasoning, explanations, writing, and code",
+    "qwen2.5:7b-instruct": "general and simple reasoning, explanations, writing, and code",
+    "qwen2.5:14b-instruct": "more complex reasoning, explanations, writing, and code",
     "llama3.1:latest": "alternate general-purpose model for open-ended questions",
 }
 DEFAULT_WORKER_MODEL = "qwen2.5:7b-instruct"
@@ -75,14 +83,46 @@ Score 5: The response fully, accurately, and clearly satisfies the request with 
 JUDGE_ACCEPT_THRESHOLD = 4
 
 console = Console()
-_active_status = None  # the live spinner, paused by tools before they print/prompt
+
+# The spinner belongs to whichever stage is currently running. Tools (called
+# deep inside an agent's tool loop) need to pause it before printing or
+# prompting. A ContextVar — rather than a plain module global — keeps this
+# correct if stages are ever awaited concurrently instead of strictly in
+# sequence, since each async task gets its own view of the variable.
+_active_status: contextvars.ContextVar[Status | None] = contextvars.ContextVar("_active_status", default=None)
 
 
 def _pause_spinner() -> None:
-    global _active_status
-    if _active_status is not None:
-        _active_status.stop()
-        _active_status = None
+    status = _active_status.get()
+    if status is not None:
+        status.stop()
+        _active_status.set(None)
+
+
+class Verdict(StrEnum):
+    ACCEPT = "accept"
+    RETRY = "retry"
+
+
+class StageState(StrEnum):
+    RUNNING = "running"
+    OK = "ok"
+    FAILED = "failed"
+
+
+class FinalSource(StrEnum):
+    LOCAL = "local"
+    CLAUDE = "claude"
+
+
+@dataclass(slots=True)
+class TrailStep:
+    label: str
+    state: StageState
+
+    def render(self) -> str:
+        glyph = {StageState.OK: "[green]✓ {}[/green]", StageState.FAILED: "[red]✗ {}[/red]", StageState.RUNNING: "[yellow]… {}[/yellow]"}
+        return glyph[self.state].format(self.label)
 
 
 def _lexer_for(path: Path) -> str:
@@ -103,7 +143,7 @@ def read_file(path: str) -> str:
         return f"ERROR: no such file: {p}"
     try:
         return p.read_text()
-    except Exception as exc:
+    except OSError as exc:
         return f"ERROR reading {p}: {exc}"
 
 
@@ -126,54 +166,64 @@ def write_file(path: str, content: str) -> str:
 TOOLS = [read_file, write_file]
 
 
-def extract_text(chunk) -> str:
-    if isinstance(chunk, str):
-        return chunk
-    return getattr(chunk, "content", "") or ""
+def extract_text(chunk: object) -> str:
+    """Pull plain text out of a stream chunk.
+
+    Ollama chunks carry plain-string content; Anthropic chunks sometimes carry
+    a list of content blocks (e.g. [{"type": "text", "text": "..."}]) instead.
+    """
+    content = chunk if isinstance(chunk, str) else getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block if isinstance(block, str) else block.get("text", "")
+            for block in content
+            if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
+        )
+    return ""
 
 
-def run_text_stage(title: str, spinner_text: str, model, prompt: str) -> str:
+async def run_text_stage(title: str, spinner_text: str, model: BaseChatModel, prompt: str | Sequence[BaseMessage]) -> str:
     """Stream a plain (tool-free) chat completion live, typewriter-style."""
-    global _active_status
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
     status = console.status(f"[dim]{spinner_text}…[/dim]", spinner="dots")
     status.start()
-    _active_status = status
-    pieces = []
+    token = _active_status.set(status)
+    pieces: list[str] = []
     try:
-        for chunk in model.stream(prompt):
+        async for chunk in model.astream(prompt):
             text = extract_text(chunk)
             if not text:
                 continue
-            if _active_status is not None:
+            if _active_status.get() is not None:
                 _pause_spinner()
             sys.stdout.write(text)
             sys.stdout.flush()
             pieces.append(text)
     finally:
         _pause_spinner()
+        _active_status.reset(token)
     print()
     console.print(f"[dim]finished in {time.monotonic() - started:.1f}s[/dim]\n")
     return "".join(pieces)
 
 
-def run_agent_stage(title: str, spinner_text: str, model, messages: list) -> str:
+async def run_agent_stage(title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[BaseMessage]) -> str:
     """Run a tool-using react agent; tools pause the spinner to print/prompt live."""
-    global _active_status
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
     status = console.status(f"[dim]{spinner_text}…[/dim]", spinner="dots")
     status.start()
-    _active_status = status
+    token = _active_status.set(status)
     agent = create_agent(model, TOOLS)
     try:
-        result = agent.invoke({"messages": messages})
+        result = await agent.ainvoke({"messages": list(messages)})
     finally:
         _pause_spinner()
-    answer = result["messages"][-1].content
-    if not isinstance(answer, str):
-        answer = str(answer)
+        _active_status.reset(token)
+    answer = extract_text(result["messages"][-1])
     console.print(answer)
     console.print(f"[dim]finished in {time.monotonic() - started:.1f}s[/dim]\n")
     return answer
@@ -201,20 +251,19 @@ def parse_route(text: str) -> str:
     return DEFAULT_WORKER_MODEL
 
 
-def parse_verdict(text: str) -> tuple[str, str]:
+def parse_verdict(text: str) -> tuple[Verdict, str]:
     match = JUDGE_RESULT_RE.search(text.strip())
     if not match:
         # Fail open: an unparseable judge response shouldn't burn a retry round.
-        return "accept", text.strip()
+        return Verdict.ACCEPT, text.strip()
     score = int(match.group(1))
     feedback = text[: match.start()].strip()
-    verdict = "accept" if score >= JUDGE_ACCEPT_THRESHOLD else "retry"
+    verdict = Verdict.ACCEPT if score >= JUDGE_ACCEPT_THRESHOLD else Verdict.RETRY
     return verdict, f"(score {score}/5) {feedback}"
 
 
-def render_trail(trail: list[tuple[str, str]]) -> None:
-    symbols = {"ok": ("[green]✓ {}[/green]"), "fail": ("[red]✗ {}[/red]"), "run": ("[yellow]… {}[/yellow]")}
-    console.print("  →  ".join(symbols[state].format(label) for label, state in trail) + "\n")
+def render_trail(trail: list[TrailStep]) -> None:
+    console.print("  →  ".join(step.render() for step in trail) + "\n")
 
 
 class QAState(TypedDict, total=False):
@@ -226,11 +275,11 @@ class QAState(TypedDict, total=False):
     answer: str
     feedback: str
     attempts: int
-    verdict: str
-    final_source: str
+    verdict: Verdict
+    final_source: FinalSource
 
 
-def answer_question(request: str) -> None:
+async def answer_question(request: str) -> None:
     started = time.monotonic()
     console.print(
         Panel.fit(
@@ -240,13 +289,13 @@ def answer_question(request: str) -> None:
         )
     )
 
-    trail: list[tuple[str, str]] = []
+    trail: list[TrailStep] = []
     router_model = ChatOllama(model=ROUTER_MODEL, base_url=OLLAMA_URL)
     judge_model = ChatOllama(model=JUDGE_MODEL, base_url=OLLAMA_URL)
     claude_model = ChatAnthropic(model_name=ESCALATION_MODEL, timeout=None, stop=None)
 
-    def route_node(state: QAState) -> dict:
-        trail.append(("Router", "run"))
+    async def route_node(state: QAState) -> dict:
+        trail.append(TrailStep("Router", StageState.RUNNING))
         options = "\n".join(f"- {tag}: best for {desc}" for tag, desc in WORKER_MODELS.items())
         prompt = f"""Choose the single best local model to answer this request.
 
@@ -257,15 +306,15 @@ Options:
 
 In one short sentence, explain your choice. Then on its own final line, output exactly:
 MODEL: <tag>"""
-        text = run_text_stage("🧭  Router", "Choosing a worker model", router_model, prompt)
+        text = await run_text_stage("🧭  Router", "Choosing a worker model", router_model, prompt)
         chosen = parse_route(text)
-        trail[-1] = ("Router", "ok")
+        trail[-1] = TrailStep("Router", StageState.OK)
         return {"worker_model": chosen}
 
-    def work_node(state: QAState) -> dict:
+    async def work_node(state: QAState) -> dict:
         model_tag = state["worker_model"]
         attempts = state.get("attempts", 0) + 1
-        trail.append((f"Worker · {model_tag} ({attempts}/{MAX_LOCAL_ATTEMPTS})", "run"))
+        trail.append(TrailStep(f"Worker · {model_tag} ({attempts}/{MAX_LOCAL_ATTEMPTS})", StageState.RUNNING))
         system = SystemMessage(
             "You have read_file and write_file tools for the local filesystem. "
             "Only call write_file if the request requires creating or modifying a file; "
@@ -275,41 +324,41 @@ MODEL: <tag>"""
         if state.get("feedback"):
             human_text += f"\n\nA reviewer rejected your previous attempt for this reason: {state['feedback']}\nPlease address it."
         worker_model = ChatOllama(model=model_tag, base_url=OLLAMA_URL)
-        answer = run_agent_stage(
+        answer = await run_agent_stage(
             f"💻  Worker · {model_tag}", "Working on it", worker_model, [system, HumanMessage(human_text)]
         )
-        trail[-1] = (trail[-1][0], "ok")
+        trail[-1] = TrailStep(trail[-1].label, StageState.OK)
         return {"answer": answer, "attempts": attempts}
 
-    def judge_node(state: QAState) -> dict:
-        trail.append(("Judge", "run"))
+    async def judge_node(state: QAState) -> dict:
+        trail.append(TrailStep("Judge", StageState.RUNNING))
         content = JUDGE_PROMPT_TEMPLATE.format(
             instruction=state["request"], response=state["answer"], rubric=JUDGE_RUBRIC
         )
         messages = [SystemMessage(JUDGE_SYSTEM_PROMPT), HumanMessage(content)]
-        text = run_text_stage(f"⚖️  Judge · {JUDGE_MODEL}", "Reviewing the answer", judge_model, messages)
+        text = await run_text_stage(f"⚖️  Judge · {JUDGE_MODEL}", "Reviewing the answer", judge_model, messages)
         verdict, feedback = parse_verdict(text)
-        trail[-1] = ("Judge", "ok" if verdict == "accept" else "fail")
+        trail[-1] = TrailStep("Judge", StageState.OK if verdict is Verdict.ACCEPT else StageState.FAILED)
         render_trail(trail)
         return {"verdict": verdict, "feedback": feedback}
 
-    def escalate_node(state: QAState) -> dict:
-        trail.append(("Escalate · Claude Sonnet", "run"))
+    async def escalate_node(state: QAState) -> dict:
+        trail.append(TrailStep("Escalate · Claude Sonnet", StageState.RUNNING))
         system = SystemMessage(
             "You have read_file and write_file tools for the local filesystem. "
             "Only call write_file if the request requires creating or modifying a file; "
             "the user must approve every write. Two local model attempts failed review; answer directly and well."
         )
         human_text = f"{state['request']}\n\n(Local model feedback from the last attempt: {state.get('feedback', 'n/a')})"
-        answer = run_agent_stage(
+        answer = await run_agent_stage(
             f"🚀  Escalate · {ESCALATION_MODEL}", "Claude is taking over", claude_model, [system, HumanMessage(human_text)]
         )
-        trail[-1] = ("Escalate · Claude Sonnet", "ok")
+        trail[-1] = TrailStep("Escalate · Claude Sonnet", StageState.OK)
         render_trail(trail)
-        return {"answer": answer, "final_source": "claude"}
+        return {"answer": answer, "final_source": FinalSource.CLAUDE}
 
     def after_judge(state: QAState) -> str:
-        if state.get("verdict") == "accept":
+        if state.get("verdict") is Verdict.ACCEPT:
             return "end"
         if state.get("attempts", 0) >= MAX_LOCAL_ATTEMPTS:
             return "escalate"
@@ -328,12 +377,12 @@ MODEL: <tag>"""
     app = graph.compile()
 
     try:
-        result = app.invoke({"request": request})
+        result = await app.ainvoke({"request": request})
     except Exception as exc:
         console.print(Panel(f"[red]Pipeline failed:[/red] {exc}\n\nIs `ollama serve` running and is ANTHROPIC_API_KEY set?", border_style="red"))
         sys.exit(1)
 
-    source = result.get("final_source", "local")
+    source = result.get("final_source", FinalSource.LOCAL)
     total_elapsed = time.monotonic() - started
     console.print(
         Panel.fit(
@@ -343,7 +392,7 @@ MODEL: <tag>"""
     )
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(
         prog="question",
         description="Local-first Q&A: router → local worker → local judge (x2) → Claude fallback.",
@@ -356,8 +405,8 @@ def main() -> None:
         console.print("[red]No question given.[/red]")
         sys.exit(1)
 
-    answer_question(request)
+    await answer_question(request)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

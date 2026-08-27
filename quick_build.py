@@ -7,9 +7,11 @@ so you're watching code get typed, never staring at a blank terminal.
 """
 
 import argparse
+import asyncio
 import re
 import sys
 import time
+from collections.abc import AsyncIterable
 from pathlib import Path
 
 from langchain_anthropic import ChatAnthropic
@@ -41,22 +43,34 @@ def strip_code_fence(text: str) -> str:
     return text.strip() + "\n"
 
 
-def extract_text(chunk) -> str:
-    if isinstance(chunk, str):
-        return chunk
-    return getattr(chunk, "content", "") or ""
+def extract_text(chunk: object) -> str:
+    """Pull plain text out of a stream chunk.
+
+    Ollama chunks carry plain-string content; Anthropic chunks sometimes carry
+    a list of content blocks (e.g. [{"type": "text", "text": "..."}]) instead.
+    """
+    content = chunk if isinstance(chunk, str) else getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block if isinstance(block, str) else block.get("text", "")
+            for block in content
+            if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
+        )
+    return ""
 
 
-def run_stage(title: str, spinner_text: str, stream_iter) -> str:
+async def run_stage(title: str, spinner_text: str, stream: AsyncIterable[object]) -> str:
     """Consume a streaming response, typing tokens out live as they arrive."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
     status = console.status(f"[dim]{spinner_text}…[/dim]", spinner="dots")
     status.start()
     spinner_running = True
-    pieces = []
+    pieces: list[str] = []
     try:
-        for chunk in stream_iter:
+        async for chunk in stream:
             text = extract_text(chunk)
             if not text:
                 continue
@@ -75,7 +89,7 @@ def run_stage(title: str, spinner_text: str, stream_iter) -> str:
     return "".join(pieces)
 
 
-def build(request: str, output: str | None = None) -> None:
+async def build(request: str, output: str | None = None) -> None:
     started = time.monotonic()
     console.print(
         Panel.fit(
@@ -102,10 +116,12 @@ EXAMPLE CODE STRUCTURE:
 [show the exact structure/outline]"""
 
     try:
-        instructions = run_stage(
-            "📋  Architect · Claude Sonnet 5",
-            "Thinking through the design",
-            sonnet.stream(architect_prompt),
+        instructions = (
+            await run_stage(
+                "📋  Architect · Claude Sonnet 5",
+                "Thinking through the design",
+                sonnet.astream(architect_prompt),
+            )
         ).strip()
     except Exception as exc:
         console.print(Panel(f"[red]Claude request failed:[/red] {exc}\n\nCheck that ANTHROPIC_API_KEY is set.", border_style="red"))
@@ -122,10 +138,10 @@ EXAMPLE CODE STRUCTURE:
 Now write the complete, production-ready code. Output ONLY the code, no prose, no explanation."""
 
     try:
-        raw_code = run_stage(
+        raw_code = await run_stage(
             "💻  Builder · Qwen2.5-Coder",
             "Writing code",
-            qwen.stream(builder_prompt),
+            qwen.astream(builder_prompt),
         )
     except Exception as exc:
         console.print(Panel(f"[red]Ollama request failed:[/red] {exc}\n\nIs `ollama serve` running?", border_style="red"))
@@ -149,7 +165,7 @@ Now write the complete, production-ready code. Output ONLY the code, no prose, n
     )
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser(
         prog="build",
         description="Two-stage AI pair programmer: Claude architects, Qwen builds.",
@@ -163,8 +179,8 @@ def main() -> None:
         console.print("[red]No request given.[/red]")
         sys.exit(1)
 
-    build(request, output=args.output)
+    await build(request, output=args.output)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
