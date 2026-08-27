@@ -22,7 +22,7 @@ from typing import TypedDict
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
@@ -210,7 +210,7 @@ async def run_text_stage(title: str, spinner_text: str, model: BaseChatModel, pr
     return "".join(pieces)
 
 
-async def run_agent_stage(title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[BaseMessage]) -> str:
+async def run_agent_stage(title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[AnyMessage]) -> str:
     """Run a tool-using react agent; tools pause the spinner to print/prompt live."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
@@ -266,10 +266,11 @@ def render_trail(trail: list[TrailStep]) -> None:
     console.print("  →  ".join(step.render() for step in trail) + "\n")
 
 
-class QAState(TypedDict, total=False):
-    # total=False because langgraph builds this up incrementally as nodes run;
-    # request/worker_model/answer/attempts/verdict are guaranteed present by the
-    # time downstream nodes read them, but TypedDict has no way to express that.
+class QAState(TypedDict):
+    # Every field ships with a placeholder default in the initial ainvoke() call
+    # below, so the dict is genuinely total=True from the start — nodes just
+    # overwrite placeholders as the graph progresses, rather than introducing
+    # keys that show up partway through.
     request: str
     worker_model: str
     answer: str
@@ -313,7 +314,7 @@ MODEL: <tag>"""
 
     async def work_node(state: QAState) -> dict:
         model_tag = state["worker_model"]
-        attempts = state.get("attempts", 0) + 1
+        attempts = state["attempts"] + 1
         trail.append(TrailStep(f"Worker · {model_tag} ({attempts}/{MAX_LOCAL_ATTEMPTS})", StageState.RUNNING))
         system = SystemMessage(
             "You have read_file and write_file tools for the local filesystem. "
@@ -321,7 +322,7 @@ MODEL: <tag>"""
             "the user must approve every write. Answer as completely and correctly as you can."
         )
         human_text = state["request"]
-        if state.get("feedback"):
+        if state["feedback"]:
             human_text += f"\n\nA reviewer rejected your previous attempt for this reason: {state['feedback']}\nPlease address it."
         worker_model = ChatOllama(model=model_tag, base_url=OLLAMA_URL)
         answer = await run_agent_stage(
@@ -349,7 +350,7 @@ MODEL: <tag>"""
             "Only call write_file if the request requires creating or modifying a file; "
             "the user must approve every write. Two local model attempts failed review; answer directly and well."
         )
-        human_text = f"{state['request']}\n\n(Local model feedback from the last attempt: {state.get('feedback', 'n/a')})"
+        human_text = f"{state['request']}\n\n(Local model feedback from the last attempt: {state['feedback']})"
         answer = await run_agent_stage(
             f"🚀  Escalate · {ESCALATION_MODEL}", "Claude is taking over", claude_model, [system, HumanMessage(human_text)]
         )
@@ -358,9 +359,9 @@ MODEL: <tag>"""
         return {"answer": answer, "final_source": FinalSource.CLAUDE}
 
     def after_judge(state: QAState) -> str:
-        if state.get("verdict") is Verdict.ACCEPT:
+        if state["verdict"] is Verdict.ACCEPT:
             return "end"
-        if state.get("attempts", 0) >= MAX_LOCAL_ATTEMPTS:
+        if state["attempts"] >= MAX_LOCAL_ATTEMPTS:
             return "escalate"
         return "retry"
 
@@ -376,13 +377,22 @@ MODEL: <tag>"""
     graph.add_edge("escalate", END)
     app = graph.compile()
 
+    initial_state: QAState = {
+        "request": request,
+        "worker_model": "",
+        "answer": "",
+        "feedback": "",
+        "attempts": 0,
+        "verdict": Verdict.RETRY,
+        "final_source": FinalSource.LOCAL,
+    }
     try:
-        result = await app.ainvoke({"request": request})
+        result = await app.ainvoke(initial_state)
     except Exception as exc:
         console.print(Panel(f"[red]Pipeline failed:[/red] {exc}\n\nIs `ollama serve` running and is ANTHROPIC_API_KEY set?", border_style="red"))
         sys.exit(1)
 
-    source = result.get("final_source", FinalSource.LOCAL)
+    source = result["final_source"]
     total_elapsed = time.monotonic() - started
     console.print(
         Panel.fit(
