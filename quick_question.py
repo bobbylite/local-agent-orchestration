@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Quick Question — local-first Q&A with a Claude safety net.
 
-A router picks the best local Ollama model for the request. A dedicated
-local judge model (Prometheus-2) reviews the answer for up to two rounds;
-if the default 7b worker fails its first round, the retry is bumped up to
-a 14b worker with web search access. If the judge still isn't satisfied,
-Claude Sonnet takes over. Every stage streams live and file writes always
-ask for permission first.
+A router picks the best local Ollama model for the request. Every local
+worker can read/write files and search the web; if the default 7b worker's
+answer is rejected by the local judge (Prometheus-2), the retry is upgraded
+to a 14b worker. If the judge still isn't satisfied after two rounds, Claude
+Sonnet takes over. Every stage streams live and file writes always ask for
+permission first.
 """
 
 import argparse
@@ -18,19 +18,20 @@ import sys
 import time
 import urllib.parse
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import TypedDict
+from typing import Final, TypedDict
 
 import httpx
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AnyMessage, BaseMessage, HumanMessage, SystemMessage
-from langchain_core.tools import tool
+from langchain_core.tools import BaseTool, tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -41,7 +42,7 @@ from rich.spinner import Spinner
 from rich.status import Status
 from rich.syntax import Syntax
 
-WORKER_MODELS = {
+WORKER_MODELS: Final[dict[str, str]] = {
     # qwen2.5-coder:7b-instruct is deliberately excluded: on this Ollama build it
     # never emits proper structured tool_calls (bare JSON text instead) and then
     # loops re-emitting the same call after seeing a tool result instead of
@@ -50,23 +51,23 @@ WORKER_MODELS = {
     "qwen2.5:14b-instruct": "more complex reasoning, explanations, writing, and code",
     "llama3.1:latest": "alternate general-purpose model for open-ended questions",
 }
-DEFAULT_WORKER_MODEL = "qwen2.5:7b-instruct"
-BUMP_WORKER_MODEL = "qwen2.5:14b-instruct"  # retried with web_search after DEFAULT_WORKER_MODEL fails judging
-ROUTER_MODEL = "qwen2.5:7b-instruct"
-JUDGE_MODEL = "prometheus2"  # imported via Modelfile from prometheus-eval/prometheus-7b-v2.0-GGUF
-ESCALATION_MODEL = "claude-sonnet-5"
-OLLAMA_URL = "http://localhost:11434"
-MAX_LOCAL_ATTEMPTS = 2
+DEFAULT_WORKER_MODEL: Final[str] = "qwen2.5:7b-instruct"
+BUMP_WORKER_MODEL: Final[str] = "qwen2.5:14b-instruct"  # used for the retry after DEFAULT_WORKER_MODEL fails judging
+ROUTER_MODEL: Final[str] = "qwen2.5:7b-instruct"
+JUDGE_MODEL: Final[str] = "prometheus2"  # imported via Modelfile from prometheus-eval/prometheus-7b-v2.0-GGUF
+ESCALATION_MODEL: Final[str] = "claude-sonnet-5"
+OLLAMA_URL: Final[str] = "http://localhost:11434"
+MAX_LOCAL_ATTEMPTS: Final[int] = 2
 
 # Exact absolute-grading prompt from https://github.com/prometheus-eval/prometheus-eval
 # (prometheus_eval/prompts.py) — Prometheus-2 was fine-tuned specifically on this format
 # and is unreliable with any other judging prompt shape.
-JUDGE_SYSTEM_PROMPT = (
+JUDGE_SYSTEM_PROMPT: Final[str] = (
     "You are a fair judge assistant tasked with providing clear, objective feedback "
     "based on specific criteria, ensuring each assessment reflects the absolute "
     "standards set for performance."
 )
-JUDGE_PROMPT_TEMPLATE = """###Task Description:
+JUDGE_PROMPT_TEMPLATE: Final[str] = """###Task Description:
 An instruction (might include an Input inside it), a response to evaluate, and a score rubric representing a evaluation criteria are given.
 1. Write a detailed feedback that assess the quality of the response strictly based on the given score rubric, not evaluating in general.
 2. After writing a feedback, write a score that is an integer between 1 and 5. You should refer to the score rubric.
@@ -83,15 +84,16 @@ An instruction (might include an Input inside it), a response to evaluate, and a
 {rubric}
 
 ###Feedback: """
-JUDGE_RUBRIC = """[Does the response correctly, completely, and helpfully satisfy the user's request?]
+JUDGE_RUBRIC: Final[str] = """[Does the response correctly, completely, and helpfully satisfy the user's request?]
 Score 1: The response is irrelevant, incorrect, or does not address the request at all.
 Score 2: The response addresses the request but has major errors, omissions, or misunderstandings.
 Score 3: The response is partially correct and helpful but has noticeable gaps or inaccuracies.
 Score 4: The response correctly and mostly completely addresses the request, with only minor issues.
 Score 5: The response fully, accurately, and clearly satisfies the request with no meaningful issues."""
-JUDGE_ACCEPT_THRESHOLD = 4
+JUDGE_ACCEPT_THRESHOLD: Final[int] = 4
+READ_URL_MAX_CHARS: Final[int] = 8000
 
-console = Console()
+console: Final = Console()
 
 # The spinner belongs to whichever stage is currently running. Tools (called
 # deep inside an agent's tool loop) need to pause it before printing or
@@ -134,12 +136,15 @@ class TrailStep:
         return glyph[self.state].format(self.label)
 
 
+_LEXER_BY_SUFFIX: Final[dict[str, str]] = {
+    ".py": "python", ".js": "javascript", ".ts": "typescript", ".json": "json",
+    ".md": "markdown", ".sh": "bash", ".yaml": "yaml", ".yml": "yaml",
+    ".html": "html", ".css": "css",
+}
+
+
 def _lexer_for(path: Path) -> str:
-    return {
-        ".py": "python", ".js": "javascript", ".ts": "typescript", ".json": "json",
-        ".md": "markdown", ".sh": "bash", ".yaml": "yaml", ".yml": "yaml",
-        ".html": "html", ".css": "css",
-    }.get(path.suffix.lower(), "text")
+    return _LEXER_BY_SUFFIX.get(path.suffix.lower(), "text")
 
 
 @tool
@@ -172,13 +177,13 @@ def write_file(path: str, content: str) -> str:
     return f"OK: wrote {len(content)} bytes to {p}"
 
 
-_TAG_RE = re.compile(r"<[^>]+>")
-_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
-SEARCH_RESULT_RE = re.compile(
+_TAG_RE: Final = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE_RE: Final = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_SEARCH_RESULT_RE: Final = re.compile(
     r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>',
     re.DOTALL,
 )
-READ_URL_MAX_CHARS = 8000
+_WEB_USER_AGENT: Final[str] = "Mozilla/5.0 (compatible; quick-question/1.0)"
 
 
 def _clean_html(fragment: str) -> str:
@@ -206,7 +211,7 @@ def web_search(query: str, max_results: int = 5) -> str:
         resp = httpx.get(
             "https://html.duckduckgo.com/html/",
             params={"q": query},
-            headers={"User-Agent": "Mozilla/5.0 (compatible; quick-question/1.0)"},
+            headers={"User-Agent": _WEB_USER_AGENT},
             timeout=10.0,
             follow_redirects=True,
         )
@@ -214,7 +219,7 @@ def web_search(query: str, max_results: int = 5) -> str:
     except httpx.HTTPError as exc:
         return f"ERROR searching web: {exc}"
 
-    matches = SEARCH_RESULT_RE.findall(resp.text)[:max_results]
+    matches = _SEARCH_RESULT_RE.findall(resp.text)[:max_results]
     if not matches:
         return "No results found."
     return "\n\n".join(
@@ -233,12 +238,8 @@ async def read_url(url: str, question: str = "") -> str:
     _pause_spinner()
     console.print(f"[cyan]🔧 read_url[/cyan] [dim]{url}[/dim]")
     try:
-        resp = httpx.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; quick-question/1.0)"},
-            timeout=15.0,
-            follow_redirects=True,
-        )
+        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+            resp = await client.get(url, headers={"User-Agent": _WEB_USER_AGENT})
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         return f"ERROR fetching {url}: {exc}"
@@ -256,8 +257,11 @@ async def read_url(url: str, question: str = "") -> str:
     return f"Summary of {url}:\n{extract_text(summary)}"
 
 
-TOOLS = [read_file, write_file, web_search, read_url]
-SEARCH_TOOLS = [*TOOLS, web_search, read_url]
+TOOLS: Final[list[BaseTool]] = [read_file, write_file, web_search, read_url]
+# Currently identical to TOOLS (every worker already has web access) — kept as
+# its own name so the model bump can be narrowed back to gating search tools
+# behind it without touching work()'s tool-selection logic.
+SEARCH_TOOLS: Final[list[BaseTool]] = TOOLS
 
 
 def extract_text(chunk: object) -> str:
@@ -307,7 +311,7 @@ async def run_text_stage(title: str, spinner_text: str, model: BaseChatModel, pr
 
 
 async def run_agent_stage(
-    title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[AnyMessage], tools: list = TOOLS
+    title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[AnyMessage], tools: Sequence[BaseTool] = TOOLS
 ) -> str:
     """Run a tool-using react agent; tools pause the spinner to print/prompt live."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
@@ -328,10 +332,10 @@ async def run_agent_stage(
     return answer
 
 
-ROUTE_RE = re.compile(r"MODEL:\s*([A-Za-z0-9_.:\-]+)", re.IGNORECASE)
+_ROUTE_RE: Final = re.compile(r"MODEL:\s*([A-Za-z0-9_.:\-]+)", re.IGNORECASE)
 # Same pattern prometheus-eval's own parser uses (prometheus_eval/parser.py),
 # tolerant of "[RESULT] N", "Score: N", "N out of 5", "N/5", etc.
-JUDGE_RESULT_RE = re.compile(
+_JUDGE_RESULT_RE: Final = re.compile(
     r"(?:\[RESULT\]|\[SCORE\]|Score:?|score:?|Result:?|\[Result\]:?|score\s+of)"
     r"\s*(?:\(|\[|\s)*(\d+)(?:(?:\)|\]|\s|$)|(?:/\s*5|\s*out\s*of\s*5))?\s*$",
     re.IGNORECASE,
@@ -340,7 +344,7 @@ JUDGE_RESULT_RE = re.compile(
 
 def parse_route(text: str) -> str:
     last = None
-    for last in ROUTE_RE.finditer(text):
+    for last in _ROUTE_RE.finditer(text):
         pass
     if last:
         candidate = last.group(1).strip()
@@ -351,7 +355,7 @@ def parse_route(text: str) -> str:
 
 
 def parse_verdict(text: str) -> tuple[Verdict, str]:
-    match = JUDGE_RESULT_RE.search(text.strip())
+    match = _JUDGE_RESULT_RE.search(text.strip())
     if not match:
         # Fail open: an unparseable judge response shouldn't burn a retry round.
         return Verdict.ACCEPT, text.strip()
@@ -379,23 +383,45 @@ class QAState(TypedDict):
     final_source: FinalSource
 
 
-async def answer_question(request: str) -> None:
-    started = time.monotonic()
-    console.print(
-        Panel.fit(
-            f"[bold]{request}[/bold]\n[dim]router → local worker → {JUDGE_MODEL} judge (×{MAX_LOCAL_ATTEMPTS}) → {ESCALATION_MODEL}[/dim]",
-            title="❓ Quick Question",
-            border_style="blue",
+class RouteUpdate(TypedDict):
+    worker_model: str
+
+
+class WorkUpdate(TypedDict):
+    answer: str
+    attempts: int
+    worker_model: str
+
+
+class JudgeUpdate(TypedDict):
+    verdict: Verdict
+    feedback: str
+
+
+class EscalateUpdate(TypedDict):
+    answer: str
+    final_source: FinalSource
+
+
+@dataclass(slots=True)
+class QuestionPipeline:
+    """Owns the per-question model instances and progress trail for one run."""
+
+    router_model: BaseChatModel
+    judge_model: BaseChatModel
+    claude_model: BaseChatModel
+    trail: list[TrailStep] = field(default_factory=list)
+
+    @classmethod
+    def create(cls) -> "QuestionPipeline":
+        return cls(
+            router_model=ChatOllama(model=ROUTER_MODEL, base_url=OLLAMA_URL),
+            judge_model=ChatOllama(model=JUDGE_MODEL, base_url=OLLAMA_URL),
+            claude_model=ChatAnthropic(model_name=ESCALATION_MODEL, timeout=None, stop=None),
         )
-    )
 
-    trail: list[TrailStep] = []
-    router_model = ChatOllama(model=ROUTER_MODEL, base_url=OLLAMA_URL)
-    judge_model = ChatOllama(model=JUDGE_MODEL, base_url=OLLAMA_URL)
-    claude_model = ChatAnthropic(model_name=ESCALATION_MODEL, timeout=None, stop=None)
-
-    async def route_node(state: QAState) -> dict:
-        trail.append(TrailStep("Router", StageState.RUNNING))
+    async def route(self, state: QAState) -> RouteUpdate:
+        self.trail.append(TrailStep("Router", StageState.RUNNING))
         options = "\n".join(f"- {tag}: best for {desc}" for tag, desc in WORKER_MODELS.items())
         prompt = f"""Choose the single best local model to answer this request.
 
@@ -406,12 +432,12 @@ Options:
 
 In one short sentence, explain your choice. Then on its own final line, output exactly:
 MODEL: <tag>"""
-        text = await run_text_stage("🧭  Orchestrating", "Choosing a worker model", router_model, prompt)
+        text = await run_text_stage("🧭  Orchestrating", "Choosing a worker model", self.router_model, prompt)
         chosen = parse_route(text)
-        trail[-1] = TrailStep("Router", StageState.OK)
+        self.trail[-1] = TrailStep("Router", StageState.OK)
         return {"worker_model": chosen}
 
-    async def work_node(state: QAState) -> dict:
+    async def work(self, state: QAState) -> WorkUpdate:
         model_tag = state["worker_model"]
         attempts = state["attempts"] + 1
         bumped = attempts > 1 and model_tag == DEFAULT_WORKER_MODEL
@@ -419,7 +445,7 @@ MODEL: <tag>"""
             model_tag = BUMP_WORKER_MODEL
         tools = SEARCH_TOOLS if bumped else TOOLS
 
-        trail.append(TrailStep(f"Worker · {model_tag} ({attempts}/{MAX_LOCAL_ATTEMPTS})", StageState.RUNNING))
+        self.trail.append(TrailStep(f"Worker · {model_tag} ({attempts}/{MAX_LOCAL_ATTEMPTS})", StageState.RUNNING))
         system = SystemMessage(
             "You have read_file and write_file tools for the local filesystem"
             + (
@@ -443,23 +469,23 @@ MODEL: <tag>"""
         answer = await run_agent_stage(
             f"💻  Worker · {model_tag}", "Working on it", worker_model, [system, HumanMessage(human_text)], tools
         )
-        trail[-1] = TrailStep(trail[-1].label, StageState.OK)
+        self.trail[-1] = TrailStep(self.trail[-1].label, StageState.OK)
         return {"answer": answer, "attempts": attempts, "worker_model": model_tag}
 
-    async def judge_node(state: QAState) -> dict:
-        trail.append(TrailStep("Judge", StageState.RUNNING))
+    async def judge(self, state: QAState) -> JudgeUpdate:
+        self.trail.append(TrailStep("Judge", StageState.RUNNING))
         content = JUDGE_PROMPT_TEMPLATE.format(
             instruction=state["request"], response=state["answer"], rubric=JUDGE_RUBRIC
         )
         messages = [SystemMessage(JUDGE_SYSTEM_PROMPT), HumanMessage(content)]
-        text = await run_text_stage(f"⚖️  Judge · {JUDGE_MODEL}", "Reviewing the answer", judge_model, messages)
+        text = await run_text_stage(f"⚖️  Judge · {JUDGE_MODEL}", "Reviewing the answer", self.judge_model, messages)
         verdict, feedback = parse_verdict(text)
-        trail[-1] = TrailStep("Judge", StageState.OK if verdict is Verdict.ACCEPT else StageState.FAILED)
-        render_trail(trail)
+        self.trail[-1] = TrailStep("Judge", StageState.OK if verdict is Verdict.ACCEPT else StageState.FAILED)
+        render_trail(self.trail)
         return {"verdict": verdict, "feedback": feedback}
 
-    async def escalate_node(state: QAState) -> dict:
-        trail.append(TrailStep("Escalate · Claude Sonnet", StageState.RUNNING))
+    async def escalate(self, state: QAState) -> EscalateUpdate:
+        self.trail.append(TrailStep("Escalate · Claude Sonnet", StageState.RUNNING))
         system = SystemMessage(
             "You have read_file and write_file tools for the local filesystem. "
             "Only call write_file if the request requires creating or modifying a file; "
@@ -467,12 +493,13 @@ MODEL: <tag>"""
         )
         human_text = f"{state['request']}\n\n(Local model feedback from the last attempt: {state['feedback']})"
         answer = await run_agent_stage(
-            f"🚀  Escalate · {ESCALATION_MODEL}", "Claude is taking over", claude_model, [system, HumanMessage(human_text)]
+            f"🚀  Escalate · {ESCALATION_MODEL}", "Claude is taking over", self.claude_model, [system, HumanMessage(human_text)]
         )
-        trail[-1] = TrailStep("Escalate · Claude Sonnet", StageState.OK)
-        render_trail(trail)
+        self.trail[-1] = TrailStep("Escalate · Claude Sonnet", StageState.OK)
+        render_trail(self.trail)
         return {"answer": answer, "final_source": FinalSource.CLAUDE}
 
+    @staticmethod
     def after_judge(state: QAState) -> str:
         if state["verdict"] is Verdict.ACCEPT:
             return "end"
@@ -480,18 +507,32 @@ MODEL: <tag>"""
             return "escalate"
         return "retry"
 
-    graph = StateGraph(QAState)
-    graph.add_node("route", route_node)
-    graph.add_node("work", work_node)
-    graph.add_node("judge", judge_node)
-    graph.add_node("escalate", escalate_node)
-    graph.add_edge(START, "route")
-    graph.add_edge("route", "work")
-    graph.add_edge("work", "judge")
-    graph.add_conditional_edges("judge", after_judge, {"end": END, "retry": "work", "escalate": "escalate"})
-    graph.add_edge("escalate", END)
-    app = graph.compile()
+    def build_graph(self) -> CompiledStateGraph:
+        graph = StateGraph(QAState)
+        graph.add_node("route", self.route)
+        graph.add_node("work", self.work)
+        graph.add_node("judge", self.judge)
+        graph.add_node("escalate", self.escalate)
+        graph.add_edge(START, "route")
+        graph.add_edge("route", "work")
+        graph.add_edge("work", "judge")
+        graph.add_conditional_edges("judge", self.after_judge, {"end": END, "retry": "work", "escalate": "escalate"})
+        graph.add_edge("escalate", END)
+        return graph.compile()
 
+
+async def answer_question(request: str) -> None:
+    started = time.monotonic()
+    console.print(
+        Panel.fit(
+            f"[bold]{request}[/bold]\n[dim]router → local worker → {JUDGE_MODEL} judge (×{MAX_LOCAL_ATTEMPTS}) → {ESCALATION_MODEL}[/dim]",
+            title="❓ Quick Question",
+            border_style="blue",
+        )
+    )
+
+    pipeline = QuestionPipeline.create()
+    app = pipeline.build_graph()
     initial_state: QAState = {
         "request": request,
         "worker_model": "",
