@@ -2,6 +2,40 @@
 
 ---
 
+## Quick setup (uv) — recommended
+
+This project uses [uv](https://docs.astral.sh/uv/) to manage Python dependencies via `pyproject.toml` — the closest equivalent to `npm install`/`npm run` for Python. It replaces the manual venv + pip steps further down; those are kept below for reference/troubleshooting.
+
+**Install uv (one-time, if you don't have it):**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+**Install dependencies:**
+```bash
+cd /path/to/quick-build
+uv sync
+```
+This reads `pyproject.toml`, resolves versions, creates a local `.venv/`, and installs everything into it — one command, no manual `python -m venv` + `pip install` dance.
+
+**Run the tools** (no need to activate the venv first — `uv run` does that for you):
+```bash
+uv run quick_build.py "async task queue with retry logic"
+uv run quick_question.py "what does this project do?"
+```
+
+**Add a new dependency:**
+```bash
+uv add some-package
+```
+This updates `pyproject.toml` and `uv.lock` and installs it immediately.
+
+**uv only manages the Python side.** You still need, separately:
+- [Ollama](https://ollama.ai) installed and running (`ollama serve`), with the local models pulled — see Step 1 and Step 4 below.
+- `ANTHROPIC_API_KEY` exported in your shell — see Step 5 below.
+
+---
+
 ## Step 1: Install Ollama on macOS
 
 ```bash
@@ -133,11 +167,15 @@ python quick_build.py "your request"
 **Post back once the test works!** Then we can add the alias and README for your Mac setup.
 
 ## Custom cli tools 
+
+Custom system tooling examples
+
+### Execute custom python
 Where build() is whatever you want the command to be.
 
 ```bash
 echo 'build() {
-  source ~/agent-env/bin/activate
+  source /Users/bobby/source/agents/quick-build/.venv/bin/activate
   python ~/quick_build.py "$@"
 }' >> ~/.zshrc
 
@@ -147,4 +185,22 @@ source ~/.zshrc
 Test it:
 ```bash
 build "async task queue with retry logic"
+```
+
+### Execute Ollama
+Where ask() is whatever model you need to ask a question to.
+
+```bash
+echo 'ask() {
+  ollama run qwen2.5-coder:7b-instruct "$@"
+}' >> ~/.zshrc
+
+source ~/.zshrc
+```
+
+Test it: 
+```bash
+ask "write a hello world function"
+ask "explain recursion"
+ask "what is REST API"
 ```
