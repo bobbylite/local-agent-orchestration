@@ -3,7 +3,7 @@
 
 Claude Sonnet plays architect and writes an exact spec; a local
 Qwen2.5-Coder model (via Ollama) implements it. Both stages stream live
-so you're watching code get typed, never staring at a blank terminal.
+so you're watching output get rendered, never staring at a blank terminal.
 """
 
 import argparse
@@ -17,8 +17,11 @@ from pathlib import Path
 from langchain_anthropic import ChatAnthropic
 from langchain_ollama import OllamaLLM
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
+from rich.spinner import Spinner
 
 ARCHITECT_MODEL = "claude-sonnet-5"
 BUILDER_MODEL = "qwen2.5-coder:7b-instruct"
@@ -62,28 +65,22 @@ def extract_text(chunk: object) -> str:
 
 
 async def run_stage(title: str, spinner_text: str, stream: AsyncIterable[object]) -> str:
-    """Consume a streaming response, typing tokens out live as they arrive."""
+    """Consume a streaming response, rendering it live as Markdown as tokens arrive."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
-    status = console.status(f"[dim]{spinner_text}…[/dim]", spinner="dots")
-    status.start()
-    spinner_running = True
     pieces: list[str] = []
-    try:
+    with Live(
+        Spinner("dots", text=f"[dim]{spinner_text}…[/dim]"),
+        console=console,
+        refresh_per_second=12,
+        vertical_overflow="visible",
+    ) as live:
         async for chunk in stream:
             text = extract_text(chunk)
             if not text:
                 continue
-            if spinner_running:
-                status.stop()
-                spinner_running = False
-            sys.stdout.write(text)
-            sys.stdout.flush()
             pieces.append(text)
-    finally:
-        if spinner_running:
-            status.stop()
-    print()
+            live.update(Markdown("".join(pieces)))
     elapsed = time.monotonic() - started
     console.print(f"[dim]finished in {elapsed:.1f}s[/dim]\n")
     return "".join(pieces)

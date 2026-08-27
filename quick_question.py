@@ -32,9 +32,12 @@ from langchain_core.tools import tool
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.rule import Rule
+from rich.spinner import Spinner
 from rich.status import Status
 from rich.syntax import Syntax
 
@@ -95,7 +98,7 @@ console = Console()
 # prompting. A ContextVar — rather than a plain module global — keeps this
 # correct if stages are ever awaited concurrently instead of strictly in
 # sequence, since each async task gets its own view of the variable.
-_active_status: contextvars.ContextVar[Status | None] = contextvars.ContextVar("_active_status", default=None)
+_active_status: contextvars.ContextVar[Status | Live | None] = contextvars.ContextVar("_active_status", default=None)
 
 
 def _pause_spinner() -> None:
@@ -276,27 +279,29 @@ def extract_text(chunk: object) -> str:
 
 
 async def run_text_stage(title: str, spinner_text: str, model: BaseChatModel, prompt: str | Sequence[BaseMessage]) -> str:
-    """Stream a plain (tool-free) chat completion live, typewriter-style."""
+    """Stream a plain (tool-free) chat completion live, rendering it as Markdown as tokens arrive."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
-    status = console.status(f"[dim]{spinner_text}…[/dim]", spinner="dots")
-    status.start()
-    token = _active_status.set(status)
     pieces: list[str] = []
+    live = Live(
+        Spinner("dots", text=f"[dim]{spinner_text}…[/dim]"),
+        console=console,
+        refresh_per_second=12,
+        vertical_overflow="visible",
+    )
+    live.start()
+    token = _active_status.set(live)
     try:
         async for chunk in model.astream(prompt):
             text = extract_text(chunk)
             if not text:
                 continue
-            if _active_status.get() is not None:
-                _pause_spinner()
-            sys.stdout.write(text)
-            sys.stdout.flush()
             pieces.append(text)
+            if _active_status.get() is not None:
+                live.update(Markdown("".join(pieces)))
     finally:
         _pause_spinner()
         _active_status.reset(token)
-    print()
     console.print(f"[dim]finished in {time.monotonic() - started:.1f}s[/dim]\n")
     return "".join(pieces)
 
@@ -317,7 +322,8 @@ async def run_agent_stage(
         _pause_spinner()
         _active_status.reset(token)
     answer = extract_text(result["messages"][-1])
-    console.print(answer)
+    if answer.strip():
+        console.print(Markdown(answer))
     console.print(f"[dim]finished in {time.monotonic() - started:.1f}s[/dim]\n")
     return answer
 
