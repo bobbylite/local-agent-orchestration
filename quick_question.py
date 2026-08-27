@@ -2,23 +2,28 @@
 """Quick Question — local-first Q&A with a Claude safety net.
 
 A router picks the best local Ollama model for the request. A dedicated
-local judge model (Prometheus-2) reviews the answer for up to two rounds.
-If the judge still isn't satisfied, Claude Sonnet takes over. Every stage
-streams live and file writes always ask for permission first.
+local judge model (Prometheus-2) reviews the answer for up to two rounds;
+if the default 7b worker fails its first round, the retry is bumped up to
+a 14b worker with web search access. If the judge still isn't satisfied,
+Claude Sonnet takes over. Every stage streams live and file writes always
+ask for permission first.
 """
 
 import argparse
 import asyncio
 import contextvars
+import html
 import re
 import sys
 import time
+import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TypedDict
 
+import httpx
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
@@ -43,6 +48,7 @@ WORKER_MODELS = {
     "llama3.1:latest": "alternate general-purpose model for open-ended questions",
 }
 DEFAULT_WORKER_MODEL = "qwen2.5:7b-instruct"
+BUMP_WORKER_MODEL = "qwen2.5:14b-instruct"  # retried with web_search after DEFAULT_WORKER_MODEL fails judging
 ROUTER_MODEL = "qwen2.5:7b-instruct"
 JUDGE_MODEL = "prometheus2"  # imported via Modelfile from prometheus-eval/prometheus-7b-v2.0-GGUF
 ESCALATION_MODEL = "claude-sonnet-5"
@@ -163,7 +169,92 @@ def write_file(path: str, content: str) -> str:
     return f"OK: wrote {len(content)} bytes to {p}"
 
 
-TOOLS = [read_file, write_file]
+_TAG_RE = re.compile(r"<[^>]+>")
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+SEARCH_RESULT_RE = re.compile(
+    r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>',
+    re.DOTALL,
+)
+READ_URL_MAX_CHARS = 8000
+
+
+def _clean_html(fragment: str) -> str:
+    return html.unescape(_TAG_RE.sub("", fragment)).strip()
+
+
+def _resolve_ddg_url(href: str) -> str:
+    """DuckDuckGo's HTML results wrap outbound links in a /l/?uddg= redirect; unwrap it."""
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urllib.parse.urlparse(href)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path == "/l/":
+        uddg = urllib.parse.parse_qs(parsed.query).get("uddg")
+        if uddg:
+            return uddg[0]
+    return href
+
+
+@tool
+def web_search(query: str, max_results: int = 5) -> str:
+    """Search the public web (via DuckDuckGo) and return titles, URLs, and snippets."""
+    _pause_spinner()
+    console.print(f"[cyan]🔧 web_search[/cyan] [dim]{query}[/dim]")
+    try:
+        resp = httpx.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; quick-question/1.0)"},
+            timeout=10.0,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return f"ERROR searching web: {exc}"
+
+    matches = SEARCH_RESULT_RE.findall(resp.text)[:max_results]
+    if not matches:
+        return "No results found."
+    return "\n\n".join(
+        f"{i}. {_clean_html(title)}\n{_resolve_ddg_url(href)}\n{_clean_html(snippet)}"
+        for i, (href, title, snippet) in enumerate(matches, start=1)
+    )
+
+
+@tool
+async def read_url(url: str, question: str = "") -> str:
+    """Fetch a web page and have a separate worker model read it and return a summary.
+
+    Use this on a link found via web_search instead of dumping raw HTML into
+    context. Pass `question` to steer the summary toward what you actually need.
+    """
+    _pause_spinner()
+    console.print(f"[cyan]🔧 read_url[/cyan] [dim]{url}[/dim]")
+    try:
+        resp = httpx.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; quick-question/1.0)"},
+            timeout=15.0,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        return f"ERROR fetching {url}: {exc}"
+
+    text = _clean_html(_SCRIPT_STYLE_RE.sub("", resp.text))[:READ_URL_MAX_CHARS]
+    if not text:
+        return f"ERROR: no readable text found at {url}"
+
+    focus = f" Focus especially on anything relevant to: {question}" if question else ""
+    console.print(f"[dim]… reader agent ({DEFAULT_WORKER_MODEL}) is summarizing the page[/dim]")
+    reader_model = ChatOllama(model=DEFAULT_WORKER_MODEL, base_url=OLLAMA_URL)
+    summary = await reader_model.ainvoke(
+        f"Read the following webpage content and write a concise, factual summary of it.{focus}\n\n{text}"
+    )
+    return f"Summary of {url}:\n{extract_text(summary)}"
+
+
+TOOLS = [read_file, write_file, web_search, read_url]
+SEARCH_TOOLS = [*TOOLS, web_search, read_url]
 
 
 def extract_text(chunk: object) -> str:
@@ -210,14 +301,16 @@ async def run_text_stage(title: str, spinner_text: str, model: BaseChatModel, pr
     return "".join(pieces)
 
 
-async def run_agent_stage(title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[AnyMessage]) -> str:
+async def run_agent_stage(
+    title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[AnyMessage], tools: list = TOOLS
+) -> str:
     """Run a tool-using react agent; tools pause the spinner to print/prompt live."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
     status = console.status(f"[dim]{spinner_text}…[/dim]", spinner="dots")
     status.start()
     token = _active_status.set(status)
-    agent = create_agent(model, TOOLS)
+    agent = create_agent(model, tools)
     try:
         result = await agent.ainvoke({"messages": list(messages)})
     finally:
@@ -307,7 +400,7 @@ Options:
 
 In one short sentence, explain your choice. Then on its own final line, output exactly:
 MODEL: <tag>"""
-        text = await run_text_stage("🧭  Router", "Choosing a worker model", router_model, prompt)
+        text = await run_text_stage("🧭  Orchestrating", "Choosing a worker model", router_model, prompt)
         chosen = parse_route(text)
         trail[-1] = TrailStep("Router", StageState.OK)
         return {"worker_model": chosen}
@@ -315,10 +408,26 @@ MODEL: <tag>"""
     async def work_node(state: QAState) -> dict:
         model_tag = state["worker_model"]
         attempts = state["attempts"] + 1
+        bumped = attempts > 1 and model_tag == DEFAULT_WORKER_MODEL
+        if bumped:
+            model_tag = BUMP_WORKER_MODEL
+        tools = SEARCH_TOOLS if bumped else TOOLS
+
         trail.append(TrailStep(f"Worker · {model_tag} ({attempts}/{MAX_LOCAL_ATTEMPTS})", StageState.RUNNING))
         system = SystemMessage(
-            "You have read_file and write_file tools for the local filesystem. "
-            "Only call write_file if the request requires creating or modifying a file; "
+            "You have read_file and write_file tools for the local filesystem"
+            + (
+                ", a web_search tool for finding pages online, and a read_url tool that fetches "
+                "a page and has another worker model summarize it for you. If the request compares "
+                "multiple named things (e.g. versions, products, options), call web_search once for "
+                "each one individually before writing the comparison — do not rely on memory alone "
+                "for any of them, even ones you feel confident about, since your recollection of one "
+                "side can be as stale or wrong as the other — then use read_url to confirm details "
+                "from the most relevant result"
+                if bumped
+                else ""
+            )
+            + ". Only call write_file if the request requires creating or modifying a file; "
             "the user must approve every write. Answer as completely and correctly as you can."
         )
         human_text = state["request"]
@@ -326,10 +435,10 @@ MODEL: <tag>"""
             human_text += f"\n\nA reviewer rejected your previous attempt for this reason: {state['feedback']}\nPlease address it."
         worker_model = ChatOllama(model=model_tag, base_url=OLLAMA_URL)
         answer = await run_agent_stage(
-            f"💻  Worker · {model_tag}", "Working on it", worker_model, [system, HumanMessage(human_text)]
+            f"💻  Worker · {model_tag}", "Working on it", worker_model, [system, HumanMessage(human_text)], tools
         )
         trail[-1] = TrailStep(trail[-1].label, StageState.OK)
-        return {"answer": answer, "attempts": attempts}
+        return {"answer": answer, "attempts": attempts, "worker_model": model_tag}
 
     async def judge_node(state: QAState) -> dict:
         trail.append(TrailStep("Judge", StageState.RUNNING))

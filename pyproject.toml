@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Local-first AI CLI tools: quick_build.py (Claude architects, Qwen builds) and quick_question.py (router -> local worker -> Prometheus-2 judge -> Claude fallback)"
 requires-python = ">=3.14"
 dependencies = [
+    "httpx>=0.28.1",
     "langchain>=1.3",
     "langchain-anthropic>=1.6",
     "langchain-ollama>=1.1",
