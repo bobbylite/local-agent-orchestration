@@ -410,22 +410,31 @@ class QuestionPipeline:
     router_model: BaseChatModel
     judge_model: BaseChatModel
     claude_model: BaseChatModel
+    history: Sequence[tuple[str, str]] = ()
     trail: list[TrailStep] = field(default_factory=list)
 
     @classmethod
-    def create(cls) -> "QuestionPipeline":
+    def create(cls, history: Sequence[tuple[str, str]] = ()) -> "QuestionPipeline":
         return cls(
             router_model=ChatOllama(model=ROUTER_MODEL, base_url=OLLAMA_URL),
             judge_model=ChatOllama(model=JUDGE_MODEL, base_url=OLLAMA_URL),
             claude_model=ChatAnthropic(model_name=ESCALATION_MODEL, timeout=None, stop=None),
+            history=history,
         )
+
+    def _context_block(self) -> str:
+        """Prior turns of this conversation, formatted as a prompt prefix (empty on turn one)."""
+        if not self.history:
+            return ""
+        turns = "\n\n".join(f"Q: {question}\nA: {answer}" for question, answer in self.history)
+        return f"Earlier in this conversation:\n{turns}\n\n"
 
     async def route(self, state: QAState) -> RouteUpdate:
         self.trail.append(TrailStep("Router", StageState.RUNNING))
         options = "\n".join(f"- {tag}: best for {desc}" for tag, desc in WORKER_MODELS.items())
         prompt = f"""Choose the single best local model to answer this request.
 
-Request: {state['request']}
+{self._context_block()}Request: {state['request']}
 
 Options:
 {options}
@@ -462,7 +471,7 @@ MODEL: <tag>"""
             + ". Only call write_file if the request requires creating or modifying a file; "
             "the user must approve every write. Answer as completely and correctly as you can."
         )
-        human_text = state["request"]
+        human_text = f"{self._context_block()}{state['request']}"
         if state["feedback"]:
             human_text += f"\n\nA reviewer rejected your previous attempt for this reason: {state['feedback']}\nPlease address it."
         worker_model = ChatOllama(model=model_tag, base_url=OLLAMA_URL)
@@ -491,7 +500,7 @@ MODEL: <tag>"""
             "Only call write_file if the request requires creating or modifying a file; "
             "the user must approve every write. Two local model attempts failed review; answer directly and well."
         )
-        human_text = f"{state['request']}\n\n(Local model feedback from the last attempt: {state['feedback']})"
+        human_text = f"{self._context_block()}{state['request']}\n\n(Local model feedback from the last attempt: {state['feedback']})"
         answer = await run_agent_stage(
             f"🚀  Escalate · {ESCALATION_MODEL}", "Claude is taking over", self.claude_model, [system, HumanMessage(human_text)]
         )
@@ -521,7 +530,7 @@ MODEL: <tag>"""
         return graph.compile()
 
 
-async def answer_question(request: str) -> None:
+async def answer_question(request: str, history: Sequence[tuple[str, str]] = ()) -> str:
     started = time.monotonic()
     console.print(
         Panel.fit(
@@ -531,7 +540,7 @@ async def answer_question(request: str) -> None:
         )
     )
 
-    pipeline = QuestionPipeline.create()
+    pipeline = QuestionPipeline.create(history)
     app = pipeline.build_graph()
     initial_state: QAState = {
         "request": request,
@@ -556,6 +565,7 @@ async def answer_question(request: str) -> None:
             border_style="green",
         )
     )
+    return result["answer"]
 
 
 async def main() -> None:
@@ -571,7 +581,14 @@ async def main() -> None:
         console.print("[red]No question given.[/red]")
         sys.exit(1)
 
-    await answer_question(request)
+    history: list[tuple[str, str]] = []
+    while request:
+        answer = await answer_question(request, history)
+        history.append((request, answer))
+        try:
+            request = console.input("[bold cyan]Follow-up question[/bold cyan] [dim](blank to quit)[/dim]: ").strip()
+        except EOFError:
+            break
 
 
 if __name__ == "__main__":
