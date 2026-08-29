@@ -14,16 +14,10 @@
   --blue:#4f8ff7;     --blue-hi:#7db0ff;  --blue-deep:#2b5ed3; --cyan:#54c9ea;
   --good:#43d3a0;     --warn:#e8b45a;     --bad:#f0716f;
   --glow:rgba(79,143,247,.45);
-  /* The sheet the whole page is printed on. Kept separate from --paper-0 so
-     component insets (inputs, chips, code) can stay darker than the stock. */
-  --stock:#161a20;
-  --emboss-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='600'%3E%3Cfilter id='p' x='0' y='0' width='100%25' height='100%25'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.05' numOctaves='5' seed='8' stitchTiles='stitch'/%3E%3CfeDiffuseLighting surfaceScale='3.6' diffuseConstant='1.0' lighting-color='%23b4b4b4'%3E%3CfeDistantLight azimuth='235' elevation='55'/%3E%3C/feDiffuseLighting%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23p)'/%3E%3C/svg%3E");
-  --emboss-opacity:.95;   --emboss-blend:soft-light;   /* tooth, lit from upper-left */
-  --mottle-opacity:.30;   --mottle-blend:soft-light;   /* cloudy pulp variation      */
-  --grain-opacity:.20;    --grain-blend:overlay;       /* fine speckle               */
-  --laid-opacity:.05;                                  /* laid lines of the mould    */
-  --aurora-opacity:.28;
-  --grid-opacity:.030;
+  /* The flat surface behind everything. Kept separate from --paper-0 so
+     component insets (inputs, chips, code) can stay darker than the ground. */
+  --stock:#0f1319;
+  --aurora-opacity:0;
   --shadow:0 1px 0 var(--edge-hi) inset, 0 18px 44px -22px rgba(0,0,0,.9);
   --card-bg:linear-gradient(168deg,var(--paper-2),var(--paper-1) 62%);
   --scan-opacity:.05;
@@ -31,21 +25,15 @@
 
 [data-theme="paper"] {
   /* cold-press sheet ------------------------------------------------------ */
-  --paper-0:#e2ddd1;  --paper-1:#eae6dd;  --paper-2:#f5f2eb;  --paper-3:#fbf9f4;
-  --edge:#c8c2b6;     --edge-soft:rgba(23,27,33,.09);         --edge-hi:rgba(255,255,255,.75);
+  --paper-0:#e4e7ec;  --paper-1:#f4f6f8;  --paper-2:#fafbfc;  --paper-3:#ffffff;
+  --edge:#d4d9e0;     --edge-soft:rgba(17,24,39,.10);         --edge-hi:rgba(255,255,255,.9);
   --ink:#171b21;      --ink-2:#454f5c;    --ink-3:#6f7a88;    --ink-4:#98a1ad;
   --blue:#2456c7;     --blue-hi:#1c47ab;  --blue-deep:#16357f; --cyan:#1a7fa0;
   --good:#12805c;     --warn:#9a6612;     --bad:#b53232;
   --glow:rgba(36,86,199,.28);
-  --stock:#f1ece2;
-  --emboss-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='600'%3E%3Cfilter id='p' x='0' y='0' width='100%25' height='100%25'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.042' numOctaves='5' seed='8' stitchTiles='stitch'/%3E%3CfeDiffuseLighting surfaceScale='1.9' diffuseConstant='1.0' lighting-color='%23ffffff'%3E%3CfeDistantLight azimuth='235' elevation='62'/%3E%3C/feDiffuseLighting%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23p)'/%3E%3C/svg%3E");
-  --emboss-opacity:.55;   --emboss-blend:multiply;
-  --mottle-opacity:.16;   --mottle-blend:multiply;
-  --grain-opacity:.20;    --grain-blend:multiply;
-  --laid-opacity:.05;
-  --aurora-opacity:.20;
-  --grid-opacity:.038;
-  --shadow:0 1px 0 var(--edge-hi) inset, 0 14px 30px -20px rgba(40,36,28,.55);
+  --stock:#eef0f3;
+  --aurora-opacity:0;
+  --shadow:0 1px 0 var(--edge-hi) inset, 0 10px 26px -18px rgba(20,28,45,.35);
   --card-bg:linear-gradient(168deg,var(--paper-3),var(--paper-2) 70%);
   --scan-opacity:.028;
 }
@@ -67,134 +55,13 @@ body {
 
 .num, code, pre, .mono { font-family:ui-monospace,"SF Mono","JetBrains Mono","Fira Code",Menlo,Consolas,monospace; }
 
-/* ── ambient layers ──────────────────────────────────────────────────────── */
+/* ── page background ────────────────────────────────────────────────────────
+   A single flat surface. Nothing animates here and nothing is layered on top
+   of it: depth in this UI comes from the cards, not from the ground they sit
+   on. --stock is also what `body` paints, so an over-scroll shows the same
+   colour rather than a seam. */
 
-.ambient {
-  position:fixed; inset:0; z-index:0; pointer-events:none; overflow:hidden;
-  background:var(--stock);
-}
-
-.aurora {
-  position:absolute; border-radius:50%;
-  filter:blur(90px);
-  opacity:var(--aurora-opacity);
-  will-change:transform;
-}
-.aurora-a { width:60vw; height:60vw; left:-14vw; top:-22vw;
-  background:radial-gradient(circle,var(--blue) 0%,transparent 66%);
-  animation:drift-a 46s ease-in-out infinite; }
-.aurora-b { width:52vw; height:52vw; right:-16vw; top:14vh;
-  background:radial-gradient(circle,var(--cyan) 0%,transparent 68%);
-  opacity:calc(var(--aurora-opacity) * .62);
-  animation:drift-b 61s ease-in-out infinite; }
-.aurora-c { width:46vw; height:46vw; left:26vw; bottom:-24vw;
-  background:radial-gradient(circle,var(--blue-deep) 0%,transparent 70%);
-  opacity:calc(var(--aurora-opacity) * .5);
-  animation:drift-c 73s ease-in-out infinite; }
-
-@keyframes drift-a {
-  0%,100% { transform:translate3d(0,0,0) scale(1); }
-  33%     { transform:translate3d(7vw,5vh,0) scale(1.14); }
-  66%     { transform:translate3d(-4vw,10vh,0) scale(.92); }
-}
-@keyframes drift-b {
-  0%,100% { transform:translate3d(0,0,0) scale(1.05); }
-  40%     { transform:translate3d(-9vw,8vh,0) scale(.88); }
-  75%     { transform:translate3d(4vw,-6vh,0) scale(1.18); }
-}
-@keyframes drift-c {
-  0%,100% { transform:translate3d(0,0,0) scale(.95); }
-  50%     { transform:translate3d(10vw,-9vh,0) scale(1.2); }
-}
-
-.grid-layer {
-  position:absolute; inset:-2px;
-  opacity:var(--grid-opacity);
-  background-image:linear-gradient(var(--ink) 1px,transparent 1px),
-                   linear-gradient(90deg,var(--ink) 1px,transparent 1px);
-  background-size:52px 52px;
-  mask-image:radial-gradient(ellipse 90% 70% at 50% 34%,#000 30%,transparent 100%);
-}
-
-/* Fine grain — the tooth of the sheet. Stepped translation keeps it alive
-   without ever redrawing the (expensive) turbulence itself. */
-.grain {
-  position:absolute; inset:-140px;
-  opacity:var(--grain-opacity);
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='260' height='260'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.86' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-  mix-blend-mode:var(--grain-blend);
-  animation:grain-shift 900ms steps(1,end) infinite;
-  will-change:transform;
-}
-@keyframes grain-shift {
-  0%   { transform:translate(0,0); }
-  12%  { transform:translate(-7px,4px); }
-  25%  { transform:translate(5px,-9px); }
-  37%  { transform:translate(-11px,-3px); }
-  50%  { transform:translate(9px,6px); }
-  62%  { transform:translate(-4px,10px); }
-  75%  { transform:translate(11px,-5px); }
-  87%  { transform:translate(-8px,-8px); }
-  100% { transform:translate(0,0); }
-}
-
-/* The paper's tooth, as actual relief rather than flat noise: turbulence run
-   through feDiffuseLighting with a distant light, which shades every fibre with
-   a highlight and a shadow. This is what makes the surface read as stock you
-   could run a thumb over instead of a grey rectangle with speckles on it. */
-.fibers {
-  position:absolute; inset:0;
-  opacity:var(--emboss-opacity);
-  mix-blend-mode:var(--emboss-blend);
-  background-image:var(--emboss-image);
-  background-size:600px 600px;
-  animation:fiber-breathe 34s ease-in-out infinite;
-}
-@keyframes fiber-breathe {
-  0%,100% { transform:scale(1) translate(0,0); }
-  50%     { transform:scale(1.035) translate(-9px,6px); }
-}
-
-/* Cloudy pulp density — the unevenness you see holding a sheet to the light. */
-.mottle {
-  position:absolute; inset:-8%;
-  opacity:var(--mottle-opacity);
-  mix-blend-mode:var(--mottle-blend);
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='800' height='800'%3E%3Cfilter id='m'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.008' numOctaves='4' seed='19' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncA type='linear' slope='.85' intercept='.08'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23m)'/%3E%3C/svg%3E");
-  background-size:800px 800px;
-  animation:mottle-drift 71s ease-in-out infinite;
-}
-@keyframes mottle-drift {
-  0%,100% { transform:translate3d(0,0,0) scale(1); }
-  50%     { transform:translate3d(2.5%,-1.8%,0) scale(1.06); }
-}
-
-/* Laid lines: the wire marks a paper mould leaves behind. Almost subliminal,
-   but it is the cue that separates "paper" from "noise". */
-.laid {
-  position:absolute; inset:0;
-  opacity:var(--laid-opacity);
-  background-image:
-    repeating-linear-gradient(0deg,  var(--ink) 0 1px, transparent 1px 4px),
-    repeating-linear-gradient(90deg, var(--ink) 0 1px, transparent 1px 27px);
-  background-size:100% 4px, 27px 100%;
-}
-.scanline {
-  position:absolute; left:0; right:0; height:38vh;
-  background:linear-gradient(180deg,transparent,var(--blue) 50%,transparent);
-  opacity:var(--scan-opacity);
-  animation:scan 17s linear infinite;
-}
-@keyframes scan {
-  0%   { transform:translateY(-40vh); }
-  100% { transform:translateY(140vh); }
-}
-
-.vignette {
-  position:absolute; inset:0;
-  background:radial-gradient(ellipse 125% 95% at 50% 40%,transparent 52%,var(--stock) 100%);
-  opacity:.80;
-}
+.page-bg { position:fixed; inset:0; z-index:0; background:var(--stock); pointer-events:none; }
 
 /* ── topbar ──────────────────────────────────────────────────────────────── */
 
@@ -292,12 +159,12 @@ body {
 
 .layout {
   position:relative; z-index:10;
-  display:flex; flex-direction:column; gap:26px;
-  padding:18px 22px 44px;
+  display:flex; flex-direction:column; gap:18px;
+  padding:11px 22px 34px;
 }
 /* ── section headings ────────────────────────────────────────────────────── */
 
-.section-head { display:flex; align-items:center; gap:14px; margin-bottom:13px; }
+.section-head { display:flex; align-items:center; gap:14px; margin-bottom:8px; }
 .section-head h1 {
   font-size:11px; font-weight:650; letter-spacing:.26em; text-transform:uppercase;
   color:var(--ink-2); white-space:nowrap;
@@ -319,27 +186,25 @@ body {
 /* ── instruments row ─────────────────────────────────────────────────────── */
 
 .instruments {
-  display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)) minmax(240px,1.9fr);
-  gap:12px; margin-bottom:16px;
+  display:grid; grid-template-columns:repeat(4,minmax(104px,.66fr)) minmax(300px,2.5fr);
+  gap:11px; margin-bottom:12px; align-items:stretch;
 }
 .inst, .scope-card {
   position:relative; overflow:hidden;
   border:1px solid var(--edge-soft); border-radius:13px;
   background:var(--card-bg); box-shadow:var(--shadow);
-  padding:12px 10px 10px;
+  padding:9px 9px 7px;
   animation:card-in .7s cubic-bezier(.2,.8,.3,1) backwards;
-}
-.inst::before, .scope-card::before {
-  content:""; position:absolute; inset:0; pointer-events:none;
-  opacity:calc(var(--grain-opacity) * .5);
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='c'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23c)'/%3E%3C/svg%3E");
 }
 .instruments .inst:nth-child(1) { animation-delay:.02s; }
 .instruments .inst:nth-child(2) { animation-delay:.07s; }
 .instruments .inst:nth-child(3) { animation-delay:.12s; }
 .instruments .inst:nth-child(4) { animation-delay:.17s; }
-.scope-card { animation-delay:.22s; padding:11px 13px 8px; }
+.scope-card { animation-delay:.22s; padding:9px 12px 7px; }
 
+/* The wrapper is exactly the dial's box, so the value stays seated in the arc's
+   opening no matter what size the dial is drawn at. */
+.gauge-wrap { position:relative; width:100%; max-width:108px; margin:0 auto; }
 .gauge { display:block; width:100%; height:auto; overflow:visible; }
 .gauge .g-track { fill:none; stroke:var(--paper-0); stroke-width:7.5; stroke-linecap:round; }
 .gauge .g-value {
@@ -356,34 +221,32 @@ body {
 .gauge .g-hub { fill:var(--paper-3); stroke:var(--edge); stroke-width:1; }
 .gauge .g-hub-dot { fill:var(--blue); animation:tick-breathe 3.2s ease-in-out infinite; }
 
-.inst-read {
-  position:absolute; left:0; right:0; bottom:12px; text-align:center; pointer-events:none;
-}
-.inst-read b {
-  display:block; font-size:19px; font-weight:600; letter-spacing:-.02em; line-height:1;
+.inst-value {
+  position:absolute; left:0; right:0; bottom:0; text-align:center; pointer-events:none;
+  font-size:14.5px; font-weight:600; letter-spacing:-.02em; line-height:1;
   font-family:ui-monospace,monospace;
 }
-.inst-read b i { font-style:normal; font-size:10px; color:var(--ink-3); margin-left:2px; }
-.inst-read em {
-  display:block; margin-top:4px;
-  font-style:normal; font-size:8.5px; letter-spacing:.15em; text-transform:uppercase; color:var(--ink-3);
+.inst-value i { font-style:normal; font-size:8.5px; color:var(--ink-3); margin-left:1px; }
+.inst-label {
+  display:block; text-align:center; margin-top:4px;
+  font-style:normal; font-size:8px; letter-spacing:.13em; text-transform:uppercase; color:var(--ink-3);
 }
-.inst[data-live="1"] .inst-read b { color:var(--blue-hi); }
+.inst[data-live="1"] .inst-value { color:var(--blue-hi); }
 
 /* ── oscilloscope ────────────────────────────────────────────────────────── */
 
 .scope-card { display:flex; flex-direction:column; }
 .scope-label {
-  display:flex; font-size:9px; letter-spacing:.15em; text-transform:uppercase;
-  color:var(--ink-3); margin-bottom:4px;
+  display:flex; font-size:8.5px; letter-spacing:.15em; text-transform:uppercase;
+  color:var(--ink-3); margin-bottom:3px;
 }
 .scope-label em {
   margin-left:auto; font-style:normal; letter-spacing:.04em; text-transform:none;
   color:var(--ink-4); font-family:ui-monospace,monospace;
 }
-#scope { width:100%; height:104px; display:block; flex:1; }
+#scope { width:100%; height:68px; display:block; flex:1; min-height:0; }
 .scope-glow {
-  position:absolute; left:0; right:0; bottom:0; height:42%;
+  position:absolute; left:0; right:0; bottom:0; height:34%;
   background:linear-gradient(180deg,transparent,var(--glow));
   opacity:.16; pointer-events:none;
 }
@@ -392,7 +255,7 @@ body {
 
 .monitor-grid {
   display:grid; gap:16px;
-  grid-template-columns:minmax(0,1.55fr) minmax(240px,.95fr) minmax(240px,1fr) minmax(230px,1fr);
+  grid-template-columns:minmax(0,1.05fr) minmax(0,1.5fr) minmax(230px,.85fr);
   align-items:stretch;
 }
 .monitor-grid > .card { display:flex; flex-direction:column; }
@@ -461,11 +324,6 @@ body {
   overflow:hidden;
   animation:card-in .7s cubic-bezier(.2,.8,.3,1) backwards;
 }
-.card::before {   /* the sheet's own tooth, so panels read as paper not glass */
-  content:""; position:absolute; inset:0; pointer-events:none;
-  opacity:calc(var(--grain-opacity) * .55);
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='c'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23c)'/%3E%3C/svg%3E");
-}
 .card::after {    /* a slow highlight travelling the top edge */
   content:""; position:absolute; top:0; left:0; height:1px; width:40%;
   background:linear-gradient(90deg,transparent,var(--blue),transparent);
@@ -484,9 +342,8 @@ body {
   to   { opacity:1; transform:none; filter:none; }
 }
 .monitor-grid > .card:nth-child(1) { animation-delay:.26s; }
-.monitor-grid > .card:nth-child(2) { animation-delay:.31s; }
-.monitor-grid > .card:nth-child(3) { animation-delay:.36s; }
-.monitor-grid > .card:nth-child(4) { animation-delay:.41s; }
+.monitor-grid > .card:nth-child(2) { animation-delay:.32s; }
+.monitor-grid > .card:nth-child(3) { animation-delay:.38s; }
 .card-console { animation-delay:.48s; }
 
 .card-title {
@@ -525,7 +382,7 @@ body {
 .roster::-webkit-scrollbar { width:7px; }
 .roster::-webkit-scrollbar-thumb { background:var(--edge); border-radius:4px; }
 .agent {
-  position:relative; padding:9px 11px; border-radius:9px;
+  position:relative; padding:7px 10px; border-radius:9px;
   border:1px solid var(--edge-soft); background:var(--paper-1);
   overflow:hidden;
   transition:border-color .35s,transform .35s,background .35s;
@@ -549,16 +406,16 @@ body {
 .agent-top { display:flex; align-items:baseline; gap:8px; }
 .agent-name { font-size:12px; font-weight:600; font-family:ui-monospace,monospace; letter-spacing:-.01em; }
 .agent-size { margin-left:auto; font-size:10px; color:var(--ink-3); font-family:ui-monospace,monospace; }
-.agent-role { font-size:10.5px; color:var(--ink-3); margin-top:2px; line-height:1.4; }
-.chips { display:flex; gap:4px; margin-top:6px; flex-wrap:wrap; }
+.agent-role { font-size:10px; color:var(--ink-3); margin-top:1px; line-height:1.35; }
+.chips { display:flex; gap:4px; margin-top:5px; flex-wrap:wrap; }
 .chip {
-  font-size:9px; letter-spacing:.07em; text-transform:uppercase;
-  padding:2px 6px; border-radius:4px;
+  font-size:8.5px; letter-spacing:.06em; text-transform:uppercase;
+  padding:1.5px 5px; border-radius:4px;
   border:1px solid var(--edge-soft); color:var(--ink-3); background:var(--paper-0);
 }
 .chip-live { border-color:color-mix(in srgb,var(--good) 50%,transparent); color:var(--good); }
 .chip-role { border-color:color-mix(in srgb,var(--blue) 45%,transparent); color:var(--blue); }
-.vram-bar { height:2px; border-radius:2px; background:var(--paper-0); margin-top:7px; overflow:hidden; }
+.vram-bar { height:2px; border-radius:2px; background:var(--paper-0); margin-top:5px; overflow:hidden; }
 .vram-bar i {
   display:block; height:100%; border-radius:2px;
   background:linear-gradient(90deg,var(--blue-deep),var(--cyan));
@@ -624,7 +481,7 @@ body {
 
 /* ── pipeline graph ──────────────────────────────────────────────────────── */
 
-.card-graph .graph { flex:1; display:flex; flex-direction:column; justify-content:center; }
+.card-graph .graph { display:flex; flex-direction:column; justify-content:center; }
 .graph { position:relative; padding-bottom:26px; }
 .graph-arc { position:absolute; inset:0; width:100%; height:100%; overflow:visible; pointer-events:none; }
 .arc-base { fill:none; stroke:var(--edge); stroke-width:1.2; stroke-dasharray:3 4; opacity:.7; }
@@ -707,6 +564,20 @@ body {
   padding:1px 4px; border-radius:3px;
   background:var(--paper-0); border:1px solid var(--edge-soft); color:var(--ink-3);
 }
+
+.merge-divider {
+  display:flex; align-items:center; gap:10px; margin:15px 0 11px;
+  font-size:9px; letter-spacing:.16em; text-transform:uppercase; color:var(--ink-3);
+}
+.merge-divider::after {
+  content:""; flex:1; height:1px;
+  background:linear-gradient(90deg,var(--edge),transparent);
+}
+.merge-divider em {
+  font-style:normal; letter-spacing:.05em; text-transform:none;
+  color:var(--ink-4); font-family:ui-monospace,monospace; order:3;
+}
+.card-graph .roster { flex:1; max-height:308px; }
 
 .graph-legend { display:flex; gap:14px; margin-top:4px; font-size:9.5px; color:var(--ink-4); letter-spacing:.06em; }
 .graph-legend span { display:flex; align-items:center; gap:5px; }
@@ -952,8 +823,9 @@ body {
 /* ── responsive ──────────────────────────────────────────────────────────── */
 
 @media (max-width:1500px) {
-  .monitor-grid { grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); }
-  .instruments { grid-template-columns:repeat(4,minmax(120px,1fr)); }
+  .monitor-grid { grid-template-columns:minmax(0,1fr) minmax(0,1.25fr); }
+  .monitor-grid > .card:last-child { grid-column:1 / -1; }
+  .instruments { grid-template-columns:repeat(4,minmax(100px,1fr)); }
   .scope-card { grid-column:1 / -1; }
 }
 @media (max-width:900px) {
@@ -977,5 +849,4 @@ body {
     animation-duration:.001ms !important; animation-iteration-count:1 !important;
     transition-duration:.001ms !important;
   }
-  .aurora, .grain, .fibers, .mottle, .scanline { animation:none !important; }
 }

@@ -10,18 +10,7 @@
 </head>
 <body>
 
-<!-- ── ambient layers: paper fibers, grain, aurora, grid, scan ───────────── -->
-<div class="ambient" aria-hidden="true">
-  <div class="aurora aurora-a"></div>
-  <div class="aurora aurora-b"></div>
-  <div class="aurora aurora-c"></div>
-  <div class="grid-layer"></div>
-  <div class="mottle"></div>
-  <div class="fibers"></div>
-  <div class="laid"></div>
-  <div class="grain"></div>
-  <div class="scanline"></div>
-  <div class="vignette"></div>
+<div class="page-bg" aria-hidden="true"></div>
 </div>
 
 <header class="topbar">
@@ -80,35 +69,13 @@
       <div class="inst" id="instJudge"></div>
       <div class="scope-card">
         <div class="scope-label">throughput <em id="scopeNote">standby</em></div>
-        <canvas id="scope" width="620" height="104"></canvas>
+        <canvas id="scope" width="620" height="68"></canvas>
         <div class="scope-glow"></div>
       </div>
     </div>
 
     <!-- pipeline + agents -->
     <div class="monitor-grid">
-      <section class="card card-graph">
-        <h2 class="card-title"><span class="tick"></span>Pipeline<em id="graphStatus">idle</em></h2>
-        <div class="graph" id="graph">
-          <svg class="graph-arc" id="graphArc" aria-hidden="true">
-            <path id="arcPath" class="arc-base"></path>
-            <path id="arcFlow" class="arc-flow"></path>
-          </svg>
-          <div class="nodes" id="nodes"></div>
-        </div>
-        <div class="graph-legend">
-          <span><i class="lg lg-idle"></i>idle</span>
-          <span><i class="lg lg-active"></i>running</span>
-          <span><i class="lg lg-done"></i>passed</span>
-          <span><i class="lg lg-failed"></i>rejected</span>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2 class="card-title"><span class="tick"></span>Agent roster<em id="rosterCount"></em></h2>
-        <div class="roster" id="roster"><div class="empty">waiting for ollama…</div></div>
-      </section>
-
       <section class="card">
         <h2 class="card-title"><span class="tick"></span>Telemetry</h2>
         <div class="tiles">
@@ -137,11 +104,29 @@
         </div>
       </section>
 
+      <section class="card card-graph">
+        <h2 class="card-title"><span class="tick"></span>Pipeline &amp; agents<em id="graphStatus">idle</em></h2>
+        <div class="graph" id="graph">
+          <svg class="graph-arc" id="graphArc" aria-hidden="true">
+            <path id="arcPath" class="arc-base"></path>
+            <path id="arcFlow" class="arc-flow"></path>
+          </svg>
+          <div class="nodes" id="nodes"></div>
+        </div>
+        <div class="graph-legend">
+          <span><i class="lg lg-idle"></i>idle</span>
+          <span><i class="lg lg-active"></i>running</span>
+          <span><i class="lg lg-done"></i>passed</span>
+          <span><i class="lg lg-failed"></i>rejected</span>
+        </div>
+        <div class="merge-divider"><span>agents</span><em id="rosterCount"></em></div>
+        <div class="roster" id="roster"><div class="empty">waiting for ollama…</div></div>
+      </section>
+
       <section class="card card-history">
         <h2 class="card-title"><span class="tick"></span>Run history<em id="historyCount"></em></h2>
         <div class="history" id="history"><div class="empty">no runs yet</div></div>
       </section>
-    </div>
   </section>
 
   <!-- ═══ CONSOLE ══════════════════════════════════════════════════════════ -->

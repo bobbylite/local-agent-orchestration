@@ -237,7 +237,7 @@ function renderOllama() {
         ${live ? '<span class="chip chip-live">resident</span>' : ""}
         ${role ? `<span class="chip chip-role">${esc(role)}</span>` : ""}
         ${caps.includes("tools") ? '<span class="chip">tools</span>' : ""}
-        <span class="chip">${esc(m.details?.quantization_level || "")}</span>
+        ${m.details?.quantization_level ? `<span class="chip">${esc(m.details.quantization_level)}</span>` : ""}
       </div>
       ${live ? `<div class="vram-bar"><i style="width:${pct}%"></i></div>` : ""}
     </div>`;
@@ -523,6 +523,7 @@ function makeGauge(host, { label, unit = "", max = 100, decimals = 0, majors = 5
     ticks.push(`<line class="g-tick${major ? " g-tick-major" : ""}" x1="${ax}" y1="${ay}" x2="${bx}" y2="${by}"/>`);
   }
   host.innerHTML = `
+    <div class="gauge-wrap">
     <svg class="gauge" viewBox="0 0 ${W} ${H}">
       <defs><linearGradient id="gaugeGrad" x1="0" y1="1" x2="1" y2="0">
         <stop offset="0%" stop-color="var(--blue-deep)"/>
@@ -536,11 +537,13 @@ function makeGauge(host, { label, unit = "", max = 100, decimals = 0, majors = 5
       <circle class="g-hub" cx="${cx}" cy="${cy}" r="6.5"/>
       <circle class="g-hub-dot" cx="${cx}" cy="${cy}" r="2.4"/>
     </svg>
-    <div class="inst-read"><b>0${unit ? `<i>${unit}</i>` : ""}</b><em>${label}</em></div>`;
+    <b class="inst-value">0${unit ? `<i>${unit}</i>` : ""}</b>
+    </div>
+    <em class="inst-label">${label}</em>`;
 
   const valueArc = host.querySelector(".g-value");
   const needle = host.querySelector(".g-needle");
-  const readout = host.querySelector(".inst-read b");
+  const readout = host.querySelector(".inst-value");
   const len = valueArc.getTotalLength();
   valueArc.style.strokeDasharray = len;
   valueArc.style.strokeDashoffset = len;
