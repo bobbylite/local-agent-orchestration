@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en" data-theme="slate">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orchestration · Agent Dashboard</title>
+<link rel="preconnect" href="http://localhost:11434">
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2312161b'/%3E%3Cpath d='M16 6l8 10-8 10-8-10z' fill='%234f8ff7'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ── ambient layers: paper fibers, grain, aurora, grid, scan ───────────── -->
+<div class="ambient" aria-hidden="true">
+  <div class="aurora aurora-a"></div>
+  <div class="aurora aurora-b"></div>
+  <div class="aurora aurora-c"></div>
+  <div class="grid-layer"></div>
+  <div class="fibers"></div>
+  <div class="grain"></div>
+  <div class="scanline"></div>
+  <div class="vignette"></div>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
+    <span class="brand-text">
+      <b>ORCHESTRATION</b>
+      <em id="brandSub">router → worker → judge → escalate</em>
+    </span>
+  </div>
+
+  <div class="pills" id="pills">
+    <div class="pill" id="pillOllama" data-state="idle">
+      <span class="dot"></span>
+      <span class="pill-body"><b id="ollamaState">connecting</b><em>ollama</em></span>
+    </div>
+    <div class="pill">
+      <span class="pill-body"><b class="num" id="statModels">0</b><em>models</em></span>
+    </div>
+    <div class="pill">
+      <span class="pill-body"><b class="num" id="statVram">0.0</b><em>gb resident</em></span>
+    </div>
+    <div class="pill">
+      <span class="pill-body"><b class="num" id="statRuns">0</b><em>runs</em></span>
+    </div>
+    <div class="pill pill-rate">
+      <span class="pill-body"><b class="num" id="statRate">0</b><em>tok/s</em></span>
+      <svg class="ekg" viewBox="0 0 120 28" preserveAspectRatio="none"><polyline id="ekgLine" points=""></polyline></svg>
+    </div>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="ghost-btn" id="themeToggle" title="Switch paper">
+      <span class="tg-track"><span class="tg-thumb"></span></span>
+    </button>
+  </div>
+  <div class="topbar-sheen" aria-hidden="true"></div>
+</header>
+
+<main class="layout">
+
+  <!-- ── left rail ──────────────────────────────────────────────────────── -->
+  <aside class="rail">
+    <section class="card" id="cardRoster">
+      <h2 class="card-title"><span class="tick"></span>Agent roster<em id="rosterCount"></em></h2>
+      <div class="roster" id="roster"><div class="empty">waiting for ollama…</div></div>
+    </section>
+
+    <section class="card">
+      <h2 class="card-title"><span class="tick"></span>Topology</h2>
+      <dl class="config" id="config"></dl>
+    </section>
+  </aside>
+
+  <!-- ── centre column ──────────────────────────────────────────────────── -->
+  <section class="column">
+
+    <section class="card card-ask">
+      <h2 class="card-title"><span class="tick"></span>Dispatch<em id="askHint">enter to run</em></h2>
+      <form class="ask" id="askForm" autocomplete="off">
+        <div class="ask-field">
+          <span class="caret-glyph">›</span>
+          <input id="askInput" type="text" placeholder="Ask the swarm something…" spellcheck="false">
+          <span class="ask-underline"></span>
+        </div>
+        <button class="run-btn" id="askBtn" type="submit">
+          <span class="run-btn-label">Dispatch</span>
+          <span class="run-btn-glow"></span>
+        </button>
+      </form>
+      <div class="suggestions" id="suggestions"></div>
+    </section>
+
+    <section class="card card-graph">
+      <h2 class="card-title"><span class="tick"></span>Pipeline<em id="graphStatus">idle</em></h2>
+      <div class="graph" id="graph">
+        <svg class="graph-arc" id="graphArc" aria-hidden="true">
+          <path id="arcPath" class="arc-base"></path>
+          <path id="arcFlow" class="arc-flow"></path>
+        </svg>
+        <div class="nodes" id="nodes"></div>
+      </div>
+      <div class="graph-legend">
+        <span><i class="lg lg-idle"></i>idle</span>
+        <span><i class="lg lg-active"></i>running</span>
+        <span><i class="lg lg-done"></i>passed</span>
+        <span><i class="lg lg-failed"></i>rejected</span>
+      </div>
+    </section>
+
+    <section class="card card-stream">
+      <h2 class="card-title">
+        <span class="tick"></span>Live transcript
+        <em id="streamMeta">no active run</em>
+        <button class="mini-btn" id="followBtn" data-on="1">follow</button>
+      </h2>
+      <div class="stream" id="stream"><div class="empty">Dispatch a question, or run <code>uv run quick_question.py …</code> in a terminal — it streams here too.</div></div>
+    </section>
+  </section>
+
+  <!-- ── right rail ─────────────────────────────────────────────────────── -->
+  <aside class="rail">
+    <section class="card">
+      <h2 class="card-title"><span class="tick"></span>Telemetry</h2>
+      <div class="tiles">
+        <div class="tile"><b class="num" id="mRuns">0</b><em>runs logged</em></div>
+        <div class="tile"><b class="num" id="mFirstPass">0<i>%</i></b><em>first-pass accept</em></div>
+        <div class="tile"><b class="num" id="mAvg">0<i>s</i></b><em>median run</em></div>
+        <div class="tile"><b class="num" id="mEsc">0</b><em>escalations</em></div>
+      </div>
+      <div class="spark-wrap">
+        <div class="spark-label">run duration <em id="sparkNote"></em></div>
+        <svg class="spark" id="spark" viewBox="0 0 240 56" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="var(--blue)" stop-opacity=".38"/>
+              <stop offset="100%" stop-color="var(--blue)" stop-opacity="0"/>
+            </linearGradient>
+          </defs>
+          <path id="sparkArea" fill="url(#sparkFill)"></path>
+          <polyline id="sparkLine"></polyline>
+          <circle id="sparkDot" r="3.2"></circle>
+        </svg>
+      </div>
+      <div class="scores">
+        <div class="spark-label">judge scores</div>
+        <div class="score-bars" id="scoreBars"></div>
+      </div>
+    </section>
+
+    <section class="card card-history">
+      <h2 class="card-title"><span class="tick"></span>Run history<em id="historyCount"></em></h2>
+      <div class="history" id="history"><div class="empty">no runs yet</div></div>
+    </section>
+  </aside>
+</main>
+
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<div class="approval-shade" id="approvalShade" hidden>
+  <div class="approval" role="dialog" aria-modal="true" aria-labelledby="apvTitle">
+    <div class="approval-pulse" aria-hidden="true"></div>
+    <h3 id="apvTitle"><span class="apv-icon">✎</span>Write permission requested</h3>
+    <p class="approval-path"><span id="apvPath"></span><em id="apvBytes"></em></p>
+    <pre class="approval-body"><code id="apvContent"></code></pre>
+    <div class="approval-actions">
+      <button class="btn btn-deny" id="apvDeny">Deny</button>
+      <button class="btn btn-allow" id="apvAllow">Allow write</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

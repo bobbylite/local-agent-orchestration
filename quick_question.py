@@ -42,18 +42,23 @@ from rich.spinner import Spinner
 from rich.status import Status
 from rich.syntax import Syntax
 
+import events
+
 WORKER_MODELS: Final[dict[str, str]] = {
-    # qwen2.5-coder:7b-instruct is deliberately excluded: on this Ollama build it
+    # qwen2.5-coder:14b-instruct is deliberately excluded: on this Ollama build it
     # never emits proper structured tool_calls (bare JSON text instead) and then
     # loops re-emitting the same call after seeing a tool result instead of
     # synthesizing an answer, which breaks the tool-using worker/escalate loop.
-    "qwen2.5:7b-instruct": "general and simple reasoning, explanations, writing, and code",
+    # The same goes for any other model tag whose `ollama show` capabilities
+    # don't include `tools` (e.g. deepseek-coder, codestral, deepseek-coder-v2) —
+    # check that before adding a tag here.
+    "mistral-nemo:12b": "general and simple reasoning, explanations, writing, and code",
     "qwen2.5:14b-instruct": "more complex reasoning, explanations, writing, and code",
-    "llama3.1:latest": "alternate general-purpose model for open-ended questions",
+    "hermes3:8b": "alternate general-purpose model for open-ended questions",
 }
-DEFAULT_WORKER_MODEL: Final[str] = "qwen2.5:7b-instruct"
+DEFAULT_WORKER_MODEL: Final[str] = "mistral-nemo:12b"
 BUMP_WORKER_MODEL: Final[str] = "qwen2.5:14b-instruct"  # used for the retry after DEFAULT_WORKER_MODEL fails judging
-ROUTER_MODEL: Final[str] = "qwen2.5:7b-instruct"
+ROUTER_MODEL: Final[str] = "mistral-nemo:12b"
 JUDGE_MODEL: Final[str] = "prometheus2"  # imported via Modelfile from prometheus-eval/prometheus-7b-v2.0-GGUF
 ESCALATION_MODEL: Final[str] = "claude-sonnet-5"
 OLLAMA_URL: Final[str] = "http://localhost:11434"
@@ -153,6 +158,7 @@ def read_file(path: str) -> str:
     _pause_spinner()
     p = Path(path).expanduser()
     console.print(f"[cyan]🔧 read_file[/cyan] [dim]{p}[/dim]")
+    events.emit(events.Kind.TOOL_CALL, tool="read_file", detail=str(p))
     if not p.is_file():
         return f"ERROR: no such file: {p}"
     try:
@@ -162,13 +168,25 @@ def read_file(path: str) -> str:
 
 
 @tool
-def write_file(path: str, content: str) -> str:
+async def write_file(path: str, content: str) -> str:
     """Write text content to a local file. Always asks the user for permission first."""
     _pause_spinner()
     p = Path(path).expanduser()
     console.print(Rule(f"[yellow]✍️  write requested → {p}[/yellow]", style="yellow"))
     console.print(Syntax(content, _lexer_for(p), line_numbers=True, word_wrap=True))
-    if not Confirm.ask(f"[bold yellow]Allow writing {len(content)} bytes to {p}?[/bold yellow]", default=False):
+    events.emit(events.Kind.TOOL_CALL, tool="write_file", detail=str(p))
+    # The dashboard approves from a browser click; with no approver registered
+    # (i.e. a plain CLI run) fall back to the terminal prompt.
+    if events.has_approver():
+        events.emit(
+            events.Kind.APPROVAL_REQUESTED,
+            path=str(p), content=content, bytes=len(content), lexer=_lexer_for(p),
+        )
+        allowed = await events.request_approval(path=str(p), bytes=len(content))
+        events.emit(events.Kind.APPROVAL_RESOLVED, path=str(p), allowed=allowed)
+    else:
+        allowed = Confirm.ask(f"[bold yellow]Allow writing {len(content)} bytes to {p}?[/bold yellow]", default=False)
+    if not allowed:
         console.print("[red]✗ write denied[/red]\n")
         return "DENIED: the user did not grant permission to write this file."
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -207,6 +225,7 @@ def web_search(query: str, max_results: int = 5) -> str:
     """Search the public web (via DuckDuckGo) and return titles, URLs, and snippets."""
     _pause_spinner()
     console.print(f"[cyan]🔧 web_search[/cyan] [dim]{query}[/dim]")
+    events.emit(events.Kind.TOOL_CALL, tool="web_search", detail=query)
     try:
         resp = httpx.get(
             "https://html.duckduckgo.com/html/",
@@ -237,6 +256,7 @@ async def read_url(url: str, question: str = "") -> str:
     """
     _pause_spinner()
     console.print(f"[cyan]🔧 read_url[/cyan] [dim]{url}[/dim]")
+    events.emit(events.Kind.TOOL_CALL, tool="read_url", detail=url)
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
             resp = await client.get(url, headers={"User-Agent": _WEB_USER_AGENT})
@@ -282,10 +302,14 @@ def extract_text(chunk: object) -> str:
     return ""
 
 
-async def run_text_stage(title: str, spinner_text: str, model: BaseChatModel, prompt: str | Sequence[BaseMessage]) -> str:
+async def run_text_stage(
+    title: str, spinner_text: str, model: BaseChatModel, prompt: str | Sequence[BaseMessage], stage: str = ""
+) -> str:
     """Stream a plain (tool-free) chat completion live, rendering it as Markdown as tokens arrive."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
+    events.set_stage(stage)
+    events.emit(events.Kind.STAGE_STARTED, title=title, model=getattr(model, "model", None) or getattr(model, "model_name", ""))
     pieces: list[str] = []
     live = Live(
         Spinner("dots", text=f"[dim]{spinner_text}…[/dim]"),
@@ -301,21 +325,27 @@ async def run_text_stage(title: str, spinner_text: str, model: BaseChatModel, pr
             if not text:
                 continue
             pieces.append(text)
+            events.emit_token(text)
             if _active_status.get() is not None:
                 live.update(Markdown("".join(pieces)))
     finally:
         _pause_spinner()
         _active_status.reset(token)
-    console.print(f"[dim]finished in {time.monotonic() - started:.1f}s[/dim]\n")
+    elapsed = time.monotonic() - started
+    events.emit(events.Kind.STAGE_FINISHED, title=title, seconds=round(elapsed, 2), chars=sum(map(len, pieces)))
+    console.print(f"[dim]finished in {elapsed:.1f}s[/dim]\n")
     return "".join(pieces)
 
 
 async def run_agent_stage(
-    title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[AnyMessage], tools: Sequence[BaseTool] = TOOLS
+    title: str, spinner_text: str, model: BaseChatModel, messages: Sequence[AnyMessage],
+    tools: Sequence[BaseTool] = TOOLS, stage: str = "",
 ) -> str:
     """Run a tool-using react agent; tools pause the spinner to print/prompt live."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
+    events.set_stage(stage)
+    events.emit(events.Kind.STAGE_STARTED, title=title, model=getattr(model, "model", None) or getattr(model, "model_name", ""))
     status = console.status(f"[dim]{spinner_text}…[/dim]", spinner="dots")
     status.start()
     token = _active_status.set(status)
@@ -328,7 +358,10 @@ async def run_agent_stage(
     answer = extract_text(result["messages"][-1])
     if answer.strip():
         console.print(Markdown(answer))
-    console.print(f"[dim]finished in {time.monotonic() - started:.1f}s[/dim]\n")
+        events.emit_token(answer)
+    elapsed = time.monotonic() - started
+    events.emit(events.Kind.STAGE_FINISHED, title=title, seconds=round(elapsed, 2), chars=len(answer))
+    console.print(f"[dim]finished in {elapsed:.1f}s[/dim]\n")
     return answer
 
 
@@ -354,15 +387,19 @@ def parse_route(text: str) -> str:
     return DEFAULT_WORKER_MODEL
 
 
-def parse_verdict(text: str) -> tuple[Verdict, str]:
+def parse_verdict(text: str) -> tuple[Verdict, str, int | None]:
+    """Return the verdict, the feedback to hand back to a retrying worker, and the raw score.
+
+    The score is None when the judge's reply had no parseable result line.
+    """
     match = _JUDGE_RESULT_RE.search(text.strip())
     if not match:
         # Fail open: an unparseable judge response shouldn't burn a retry round.
-        return Verdict.ACCEPT, text.strip()
+        return Verdict.ACCEPT, text.strip(), None
     score = int(match.group(1))
     feedback = text[: match.start()].strip()
     verdict = Verdict.ACCEPT if score >= JUDGE_ACCEPT_THRESHOLD else Verdict.RETRY
-    return verdict, f"(score {score}/5) {feedback}"
+    return verdict, f"(score {score}/5) {feedback}", score
 
 
 def render_trail(trail: list[TrailStep]) -> None:
@@ -441,9 +478,10 @@ Options:
 
 In one short sentence, explain your choice. Then on its own final line, output exactly:
 MODEL: <tag>"""
-        text = await run_text_stage("🧭  Orchestrating", "Choosing a worker model", self.router_model, prompt)
+        text = await run_text_stage("🧭  Orchestrating", "Choosing a worker model", self.router_model, prompt, stage="route")
         chosen = parse_route(text)
         self.trail[-1] = TrailStep("Router", StageState.OK)
+        events.emit(events.Kind.STAGE_FINISHED, stage="route", chose=chosen)
         return {"worker_model": chosen}
 
     async def work(self, state: QAState) -> WorkUpdate:
@@ -475,8 +513,9 @@ MODEL: <tag>"""
         if state["feedback"]:
             human_text += f"\n\nA reviewer rejected your previous attempt for this reason: {state['feedback']}\nPlease address it."
         worker_model = ChatOllama(model=model_tag, base_url=OLLAMA_URL)
+        events.emit(events.Kind.STAGE_STARTED, stage="work", model=model_tag, attempt=attempts, bumped=bumped)
         answer = await run_agent_stage(
-            f"💻  Worker · {model_tag}", "Working on it", worker_model, [system, HumanMessage(human_text)], tools
+            f"💻  Worker · {model_tag}", "Working on it", worker_model, [system, HumanMessage(human_text)], tools, stage="work"
         )
         self.trail[-1] = TrailStep(self.trail[-1].label, StageState.OK)
         return {"answer": answer, "attempts": attempts, "worker_model": model_tag}
@@ -487,9 +526,13 @@ MODEL: <tag>"""
             instruction=state["request"], response=state["answer"], rubric=JUDGE_RUBRIC
         )
         messages = [SystemMessage(JUDGE_SYSTEM_PROMPT), HumanMessage(content)]
-        text = await run_text_stage(f"⚖️  Judge · {JUDGE_MODEL}", "Reviewing the answer", self.judge_model, messages)
-        verdict, feedback = parse_verdict(text)
+        text = await run_text_stage(f"⚖️  Judge · {JUDGE_MODEL}", "Reviewing the answer", self.judge_model, messages, stage="judge")
+        verdict, feedback, score = parse_verdict(text)
         self.trail[-1] = TrailStep("Judge", StageState.OK if verdict is Verdict.ACCEPT else StageState.FAILED)
+        events.emit(
+            events.Kind.VERDICT, stage="judge", verdict=str(verdict), score=score,
+            threshold=JUDGE_ACCEPT_THRESHOLD, feedback=feedback,
+        )
         render_trail(self.trail)
         return {"verdict": verdict, "feedback": feedback}
 
@@ -502,7 +545,8 @@ MODEL: <tag>"""
         )
         human_text = f"{self._context_block()}{state['request']}\n\n(Local model feedback from the last attempt: {state['feedback']})"
         answer = await run_agent_stage(
-            f"🚀  Escalate · {ESCALATION_MODEL}", "Claude is taking over", self.claude_model, [system, HumanMessage(human_text)]
+            f"🚀  Escalate · {ESCALATION_MODEL}", "Claude is taking over", self.claude_model,
+            [system, HumanMessage(human_text)], stage="escalate",
         )
         self.trail[-1] = TrailStep("Escalate · Claude Sonnet", StageState.OK)
         render_trail(self.trail)
@@ -530,15 +574,14 @@ MODEL: <tag>"""
         return graph.compile()
 
 
-async def answer_question(request: str, history: Sequence[tuple[str, str]] = ()) -> str:
+async def run_pipeline(request: str, history: Sequence[tuple[str, str]] = ()) -> QAState:
+    """Drive one question end to end and return the final state.
+
+    Opens a run on the event bus, emits the closing event either way, and lets
+    failures propagate so each front end can present them its own way.
+    """
     started = time.monotonic()
-    console.print(
-        Panel.fit(
-            f"[bold]{request}[/bold]\n[dim]router → local worker → {JUDGE_MODEL} judge (×{MAX_LOCAL_ATTEMPTS}) → {ESCALATION_MODEL}[/dim]",
-            title="❓ Quick Question",
-            border_style="blue",
-        )
-    )
+    events.new_run(request, tool="quick_question", pipeline=["route", "work", "judge", "escalate"])
 
     pipeline = QuestionPipeline.create(history)
     app = pipeline.build_graph()
@@ -552,16 +595,36 @@ async def answer_question(request: str, history: Sequence[tuple[str, str]] = ())
         "final_source": FinalSource.LOCAL,
     }
     try:
-        result = await app.ainvoke(initial_state)
+        result: QAState = await app.ainvoke(initial_state)
+    except Exception as exc:
+        events.emit(events.Kind.RUN_FAILED, error=str(exc))
+        raise
+    events.emit(
+        events.Kind.RUN_FINISHED, source=str(result["final_source"]), seconds=round(time.monotonic() - started, 2),
+        worker_model=result["worker_model"], attempts=result["attempts"], answer=result["answer"],
+    )
+    return result
+
+
+async def answer_question(request: str, history: Sequence[tuple[str, str]] = ()) -> str:
+    started = time.monotonic()
+    console.print(
+        Panel.fit(
+            f"[bold]{request}[/bold]\n[dim]router → local worker → {JUDGE_MODEL} judge (×{MAX_LOCAL_ATTEMPTS}) → {ESCALATION_MODEL}[/dim]",
+            title="❓ Quick Question",
+            border_style="blue",
+        )
+    )
+    try:
+        result = await run_pipeline(request, history)
     except Exception as exc:
         console.print(Panel(f"[red]Pipeline failed:[/red] {exc}\n\nIs `ollama serve` running and is ANTHROPIC_API_KEY set?", border_style="red"))
         sys.exit(1)
 
-    source = result["final_source"]
-    total_elapsed = time.monotonic() - started
     console.print(
         Panel.fit(
-            f"[bold green]✓ Answered[/bold green] via [bold]{source}[/bold]  ·  {total_elapsed:.1f}s total",
+            f"[bold green]✓ Answered[/bold green] via [bold]{result['final_source']}[/bold]"
+            f"  ·  {time.monotonic() - started:.1f}s total",
             border_style="green",
         )
     )

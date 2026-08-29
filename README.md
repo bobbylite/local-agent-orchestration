@@ -204,3 +204,51 @@ ask "write a hello world function"
 ask "explain recursion"
 ask "what is REST API"
 ```
+---
+
+## Web dashboard
+
+A live view of the agents: the pipeline graph animating stage by stage, streamed
+tokens, judge scores, Ollama VRAM residency, and toast notifications for every
+transition.
+
+```bash
+./launch.sh             # → http://127.0.0.1:8787
+```
+
+`launch.sh` is the front door for the whole project. It runs preflight checks
+(uv, `uv sync`, Ollama reachable, API key present), frees the port if a previous
+dashboard is still holding it, then starts the server:
+
+```bash
+./launch.sh                  # start the dashboard (default)
+./launch.sh ask "question"   # quick_question.py, after the same preflight
+./launch.sh build "a thing"  # quick_build.py
+./launch.sh status           # what's running, what's resident in VRAM
+./launch.sh stop             # free the dashboard port
+```
+
+It only ever kills *its own* dashboard — anything else holding the port is
+reported and left alone. Set `DASHBOARD_PORT` to run somewhere else; the server
+reads the same variable, so the two cannot drift apart.
+
+`uv run dashboard.py` still works if you'd rather skip the preflight.
+
+**It shows terminal runs too.** Every stage in `quick_question.py` and
+`quick_build.py` emits structured events to a shared run log
+(`~/.quick-agents/runs.jsonl`, override with `QUICK_AGENTS_HOME`). The dashboard
+tails that log, so a `uv run quick_question.py "…"` in another window animates in
+an already-open browser tab — tagged `cli` to distinguish it from runs you
+dispatch from the page itself.
+
+**Write approvals move to the browser.** When a worker calls `write_file` during
+a dashboard-dispatched run, the diff appears in a modal with Allow / Deny instead
+of prompting in the terminal. CLI runs keep the existing terminal prompt — the
+approval path is chosen by whether an approver is registered, so neither front
+end had to change the other's behaviour.
+
+There is **no authentication**; the server binds to loopback only and is meant
+for a single developer's machine. Don't expose it.
+
+Files: [dashboard.py](dashboard.py) (SSE hub, Ollama poller, log tailer),
+[events.py](events.py) (the event bus), [static/](static/) (the UI).

@@ -23,6 +23,8 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.spinner import Spinner
 
+import events
+
 ARCHITECT_MODEL = "claude-sonnet-5"
 BUILDER_MODEL = "qwen2.5-coder:7b-instruct"
 OLLAMA_URL = "http://localhost:11434"
@@ -64,10 +66,12 @@ def extract_text(chunk: object) -> str:
     return ""
 
 
-async def run_stage(title: str, spinner_text: str, stream: AsyncIterable[object]) -> str:
+async def run_stage(title: str, spinner_text: str, stream: AsyncIterable[object], stage: str = "") -> str:
     """Consume a streaming response, rendering it live as Markdown as tokens arrive."""
     console.print(Rule(f"[bold cyan]{title}[/bold cyan]", style="cyan"))
     started = time.monotonic()
+    events.set_stage(stage)
+    events.emit(events.Kind.STAGE_STARTED, title=title)
     pieces: list[str] = []
     with Live(
         Spinner("dots", text=f"[dim]{spinner_text}…[/dim]"),
@@ -80,14 +84,17 @@ async def run_stage(title: str, spinner_text: str, stream: AsyncIterable[object]
             if not text:
                 continue
             pieces.append(text)
+            events.emit_token(text)
             live.update(Markdown("".join(pieces)))
     elapsed = time.monotonic() - started
+    events.emit(events.Kind.STAGE_FINISHED, title=title, seconds=round(elapsed, 2), chars=sum(map(len, pieces)))
     console.print(f"[dim]finished in {elapsed:.1f}s[/dim]\n")
     return "".join(pieces)
 
 
 async def build(request: str, output: str | None = None) -> None:
     started = time.monotonic()
+    events.new_run(request, tool="quick_build", pipeline=["architect", "builder"])
     console.print(
         Panel.fit(
             f"[bold]{request}[/bold]\n[dim]{ARCHITECT_MODEL} → {BUILDER_MODEL}[/dim]",
@@ -118,9 +125,11 @@ EXAMPLE CODE STRUCTURE:
                 "📋  Architect · Claude Sonnet 5",
                 "Thinking through the design",
                 sonnet.astream(architect_prompt),
+                stage="architect",
             )
         ).strip()
     except Exception as exc:
+        events.emit(events.Kind.RUN_FAILED, error=str(exc))
         console.print(Panel(f"[red]Claude request failed:[/red] {exc}\n\nCheck that ANTHROPIC_API_KEY is set.", border_style="red"))
         sys.exit(1)
 
@@ -139,8 +148,10 @@ Now write the complete, production-ready code. Output ONLY the code, no prose, n
             "💻  Builder · Qwen2.5-Coder",
             "Writing code",
             qwen.astream(builder_prompt),
+            stage="builder",
         )
     except Exception as exc:
+        events.emit(events.Kind.RUN_FAILED, error=str(exc))
         console.print(Panel(f"[red]Ollama request failed:[/red] {exc}\n\nIs `ollama serve` running?", border_style="red"))
         sys.exit(1)
 
@@ -154,6 +165,10 @@ Now write the complete, production-ready code. Output ONLY the code, no prose, n
 
     total_elapsed = time.monotonic() - started
     line_count = code.count("\n")
+    events.emit(
+        events.Kind.RUN_FINISHED, source="local", seconds=round(total_elapsed, 2),
+        worker_model=BUILDER_MODEL, path=str(path), lines=line_count,
+    )
     console.print(
         Panel.fit(
             f"[bold green]✓ Saved[/bold green] [bold]{path}[/bold]  ·  {line_count} lines  ·  {total_elapsed:.1f}s total",
