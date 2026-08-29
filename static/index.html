@@ -16,7 +16,9 @@
   <div class="aurora aurora-b"></div>
   <div class="aurora aurora-c"></div>
   <div class="grid-layer"></div>
+  <div class="mottle"></div>
   <div class="fibers"></div>
+  <div class="laid"></div>
   <div class="grain"></div>
   <div class="scanline"></div>
   <div class="vignette"></div>
@@ -61,100 +63,138 @@
 
 <main class="layout">
 
-  <!-- ── left rail ──────────────────────────────────────────────────────── -->
-  <aside class="rail">
-    <section class="card" id="cardRoster">
-      <h2 class="card-title"><span class="tick"></span>Agent roster<em id="rosterCount"></em></h2>
-      <div class="roster" id="roster"><div class="empty">waiting for ollama…</div></div>
-    </section>
+  <!-- ═══ MONITORING ═══════════════════════════════════════════════════════ -->
+  <section class="monitor">
 
-    <section class="card">
-      <h2 class="card-title"><span class="tick"></span>Topology</h2>
-      <dl class="config" id="config"></dl>
-    </section>
-  </aside>
+    <div class="section-head">
+      <h1>Monitoring</h1>
+      <span class="rule"></span>
+      <button class="mini-btn" id="sweepBtn" title="Run the instruments through their range">demo sweep</button>
+    </div>
 
-  <!-- ── centre column ──────────────────────────────────────────────────── -->
-  <section class="column">
+    <!-- instruments row -->
+    <div class="instruments">
+      <div class="inst" id="instTok"></div>
+      <div class="inst" id="instVram"></div>
+      <div class="inst" id="instAccept"></div>
+      <div class="inst" id="instJudge"></div>
+      <div class="scope-card">
+        <div class="scope-label">throughput <em id="scopeNote">standby</em></div>
+        <canvas id="scope" width="620" height="104"></canvas>
+        <div class="scope-glow"></div>
+      </div>
+    </div>
 
-    <section class="card card-ask">
-      <h2 class="card-title"><span class="tick"></span>Dispatch<em id="askHint">enter to run</em></h2>
-      <form class="ask" id="askForm" autocomplete="off">
-        <div class="ask-field">
-          <span class="caret-glyph">›</span>
-          <input id="askInput" type="text" placeholder="Ask the swarm something…" spellcheck="false">
-          <span class="ask-underline"></span>
+    <!-- pipeline + agents -->
+    <div class="monitor-grid">
+      <section class="card card-graph">
+        <h2 class="card-title"><span class="tick"></span>Pipeline<em id="graphStatus">idle</em></h2>
+        <div class="graph" id="graph">
+          <svg class="graph-arc" id="graphArc" aria-hidden="true">
+            <path id="arcPath" class="arc-base"></path>
+            <path id="arcFlow" class="arc-flow"></path>
+          </svg>
+          <div class="nodes" id="nodes"></div>
         </div>
-        <button class="run-btn" id="askBtn" type="submit">
-          <span class="run-btn-label">Dispatch</span>
-          <span class="run-btn-glow"></span>
-        </button>
-      </form>
-      <div class="suggestions" id="suggestions"></div>
-    </section>
+        <div class="graph-legend">
+          <span><i class="lg lg-idle"></i>idle</span>
+          <span><i class="lg lg-active"></i>running</span>
+          <span><i class="lg lg-done"></i>passed</span>
+          <span><i class="lg lg-failed"></i>rejected</span>
+        </div>
+      </section>
 
-    <section class="card card-graph">
-      <h2 class="card-title"><span class="tick"></span>Pipeline<em id="graphStatus">idle</em></h2>
-      <div class="graph" id="graph">
-        <svg class="graph-arc" id="graphArc" aria-hidden="true">
-          <path id="arcPath" class="arc-base"></path>
-          <path id="arcFlow" class="arc-flow"></path>
-        </svg>
-        <div class="nodes" id="nodes"></div>
-      </div>
-      <div class="graph-legend">
-        <span><i class="lg lg-idle"></i>idle</span>
-        <span><i class="lg lg-active"></i>running</span>
-        <span><i class="lg lg-done"></i>passed</span>
-        <span><i class="lg lg-failed"></i>rejected</span>
-      </div>
-    </section>
+      <section class="card">
+        <h2 class="card-title"><span class="tick"></span>Agent roster<em id="rosterCount"></em></h2>
+        <div class="roster" id="roster"><div class="empty">waiting for ollama…</div></div>
+      </section>
 
-    <section class="card card-stream">
-      <h2 class="card-title">
-        <span class="tick"></span>Live transcript
-        <em id="streamMeta">no active run</em>
-        <button class="mini-btn" id="followBtn" data-on="1">follow</button>
-      </h2>
-      <div class="stream" id="stream"><div class="empty">Dispatch a question, or run <code>uv run quick_question.py …</code> in a terminal — it streams here too.</div></div>
-    </section>
+      <section class="card">
+        <h2 class="card-title"><span class="tick"></span>Telemetry</h2>
+        <div class="tiles">
+          <div class="tile"><b class="num" id="mRuns">0</b><em>runs logged</em></div>
+          <div class="tile"><b class="num" id="mFirstPass">0<i>%</i></b><em>first-pass accept</em></div>
+          <div class="tile"><b class="num" id="mAvg">0<i>s</i></b><em>median run</em></div>
+          <div class="tile"><b class="num" id="mEsc">0</b><em>escalations</em></div>
+        </div>
+        <div class="spark-wrap">
+          <div class="spark-label">run duration <em id="sparkNote"></em></div>
+          <svg class="spark" id="spark" viewBox="0 0 240 56" preserveAspectRatio="none">
+            <defs>
+              <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stop-color="var(--blue)" stop-opacity=".38"/>
+                <stop offset="100%" stop-color="var(--blue)" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path id="sparkArea" fill="url(#sparkFill)"></path>
+            <polyline id="sparkLine"></polyline>
+            <circle id="sparkDot" r="3.2"></circle>
+          </svg>
+        </div>
+        <div class="scores">
+          <div class="spark-label">judge scores</div>
+          <div class="score-bars" id="scoreBars"></div>
+        </div>
+      </section>
+
+      <section class="card card-history">
+        <h2 class="card-title"><span class="tick"></span>Run history<em id="historyCount"></em></h2>
+        <div class="history" id="history"><div class="empty">no runs yet</div></div>
+      </section>
+    </div>
   </section>
 
-  <!-- ── right rail ─────────────────────────────────────────────────────── -->
-  <aside class="rail">
-    <section class="card">
-      <h2 class="card-title"><span class="tick"></span>Telemetry</h2>
-      <div class="tiles">
-        <div class="tile"><b class="num" id="mRuns">0</b><em>runs logged</em></div>
-        <div class="tile"><b class="num" id="mFirstPass">0<i>%</i></b><em>first-pass accept</em></div>
-        <div class="tile"><b class="num" id="mAvg">0<i>s</i></b><em>median run</em></div>
-        <div class="tile"><b class="num" id="mEsc">0</b><em>escalations</em></div>
-      </div>
-      <div class="spark-wrap">
-        <div class="spark-label">run duration <em id="sparkNote"></em></div>
-        <svg class="spark" id="spark" viewBox="0 0 240 56" preserveAspectRatio="none">
-          <defs>
-            <linearGradient id="sparkFill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stop-color="var(--blue)" stop-opacity=".38"/>
-              <stop offset="100%" stop-color="var(--blue)" stop-opacity="0"/>
-            </linearGradient>
-          </defs>
-          <path id="sparkArea" fill="url(#sparkFill)"></path>
-          <polyline id="sparkLine"></polyline>
-          <circle id="sparkDot" r="3.2"></circle>
-        </svg>
-      </div>
-      <div class="scores">
-        <div class="spark-label">judge scores</div>
-        <div class="score-bars" id="scoreBars"></div>
-      </div>
-    </section>
+  <!-- ═══ CONSOLE ══════════════════════════════════════════════════════════ -->
+  <section class="console">
+    <div class="section-head">
+      <h1>Console</h1>
+      <span class="rule"></span>
+      <span class="terminal-hint">runs started in your terminal stream here automatically</span>
+    </div>
 
-    <section class="card card-history">
-      <h2 class="card-title"><span class="tick"></span>Run history<em id="historyCount"></em></h2>
-      <div class="history" id="history"><div class="empty">no runs yet</div></div>
-    </section>
-  </aside>
+    <div class="card card-console">
+      <div class="tabs" role="tablist">
+        <button class="tab is-active" data-tab="dispatch" role="tab">Dispatch</button>
+        <button class="tab" data-tab="transcript" role="tab">Transcript<i class="tab-dot" id="tabDot"></i></button>
+        <button class="tab" data-tab="answer" role="tab">Answer</button>
+        <button class="tab" data-tab="topology" role="tab">Topology</button>
+        <span class="tab-ink" id="tabInk"></span>
+        <span class="tab-meta" id="streamMeta">no active run</span>
+        <button class="mini-btn" id="followBtn" data-on="1">follow</button>
+      </div>
+
+      <div class="panel is-active" data-panel="dispatch">
+        <form class="ask" id="askForm" autocomplete="off">
+          <div class="ask-field">
+            <span class="caret-glyph">›</span>
+            <input id="askInput" type="text" placeholder="Ask the swarm something…" spellcheck="false">
+            <span class="ask-underline"></span>
+          </div>
+          <button class="run-btn" id="askBtn" type="submit">
+            <span class="run-btn-label">Dispatch</span>
+            <span class="run-btn-glow"></span>
+          </button>
+        </form>
+        <div class="suggestions" id="suggestions"></div>
+        <p class="dispatch-note">
+          Or run <code>uv run quick_question.py "…"</code> in a terminal — the pipeline
+          streams into these instruments either way.
+        </p>
+      </div>
+
+      <div class="panel" data-panel="transcript">
+        <div class="stream" id="stream"><div class="empty">Dispatch a question, or run <code>uv run quick_question.py …</code> in a terminal — it streams here too.</div></div>
+      </div>
+
+      <div class="panel" data-panel="answer">
+        <div class="answer" id="answer"><div class="empty">the final answer of the selected run appears here</div></div>
+      </div>
+
+      <div class="panel" data-panel="topology">
+        <dl class="config" id="config"></dl>
+      </div>
+    </div>
+  </section>
 </main>
 
 <div class="toasts" id="toasts" role="status" aria-live="polite"></div>

@@ -610,7 +610,7 @@ async def answer_question(request: str, history: Sequence[tuple[str, str]] = ())
     started = time.monotonic()
     console.print(
         Panel.fit(
-            f"[bold]{request}[/bold]\n[dim]router → local worker → {JUDGE_MODEL} judge (×{MAX_LOCAL_ATTEMPTS}) → {ESCALATION_MODEL}[/dim]",
+            f"[bold]{request}[/bold]\n[dim]{DEFAULT_WORKER_MODEL} Orchestrator → local worker → {JUDGE_MODEL} judge (×{MAX_LOCAL_ATTEMPTS}) → {ESCALATION_MODEL}[/dim]",
             title="❓ Quick Question",
             border_style="blue",
         )

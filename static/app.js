@@ -391,6 +391,7 @@ function renderTelemetry() {
   tweenNum($("mEsc"), done.filter((r) => r.source === "claude").length);
 
   drawSpark(done.slice(-26).map((r) => r.seconds || 0));
+  refreshInstruments();
 
   const buckets = [0, 0, 0, 0, 0];
   runs.forEach((r) => r.stages.forEach((s) => { if (s.score >= 1 && s.score <= 5) buckets[s.score - 1]++; }));
@@ -467,6 +468,7 @@ function renderAll() {
   renderStream();
   renderTelemetry();
   renderHistory();
+  renderAnswer();
 }
 
 /* ── approval modal ─────────────────────────────────────────────────────── */
@@ -494,6 +496,192 @@ async function resolveApproval(allow) {
   }
 }
 
+/* ── instruments ────────────────────────────────────────────────────────────
+   Each gauge is a 240° arc with its own needle. Values are eased toward the
+   target every frame rather than snapped, so a reading that jumps still reads
+   as a physical movement — and the needle keeps a faint idle tremor so the
+   panel never looks frozen when the pipeline is quiet.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+const SWEEP_START = -210, SWEEP_END = 30;           // degrees, clockwise from 3 o'clock
+const polar = (cx, cy, r, deg) => {
+  const rad = (deg * Math.PI) / 180;
+  return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+};
+const arcPath = (cx, cy, r, from, to) => {
+  const [x1, y1] = polar(cx, cy, r, from), [x2, y2] = polar(cx, cy, r, to);
+  return `M ${x1} ${y1} A ${r} ${r} 0 ${Math.abs(to - from) > 180 ? 1 : 0} 1 ${x2} ${y2}`;
+};
+
+function makeGauge(host, { label, unit = "", max = 100, decimals = 0, majors = 5 }) {
+  const W = 132, H = 104, cx = 66, cy = 66, r = 45;
+  const ticks = [];
+  for (let i = 0; i <= majors * 2; i++) {
+    const deg = SWEEP_START + ((SWEEP_END - SWEEP_START) * i) / (majors * 2);
+    const major = i % 2 === 0;
+    const [ax, ay] = polar(cx, cy, r - 11, deg), [bx, by] = polar(cx, cy, r - (major ? 17 : 14.5), deg);
+    ticks.push(`<line class="g-tick${major ? " g-tick-major" : ""}" x1="${ax}" y1="${ay}" x2="${bx}" y2="${by}"/>`);
+  }
+  host.innerHTML = `
+    <svg class="gauge" viewBox="0 0 ${W} ${H}">
+      <defs><linearGradient id="gaugeGrad" x1="0" y1="1" x2="1" y2="0">
+        <stop offset="0%" stop-color="var(--blue-deep)"/>
+        <stop offset="55%" stop-color="var(--blue)"/>
+        <stop offset="100%" stop-color="var(--cyan)"/>
+      </linearGradient></defs>
+      <path class="g-track" d="${arcPath(cx, cy, r, SWEEP_START, SWEEP_END)}"/>
+      <path class="g-value" d="${arcPath(cx, cy, r, SWEEP_START, SWEEP_END)}"/>
+      ${ticks.join("")}
+      <line class="g-needle" x1="${cx}" y1="${cy}" x2="${cx}" y2="${cy - r + 15}"/>
+      <circle class="g-hub" cx="${cx}" cy="${cy}" r="6.5"/>
+      <circle class="g-hub-dot" cx="${cx}" cy="${cy}" r="2.4"/>
+    </svg>
+    <div class="inst-read"><b>0${unit ? `<i>${unit}</i>` : ""}</b><em>${label}</em></div>`;
+
+  const valueArc = host.querySelector(".g-value");
+  const needle = host.querySelector(".g-needle");
+  const readout = host.querySelector(".inst-read b");
+  const len = valueArc.getTotalLength();
+  valueArc.style.strokeDasharray = len;
+  valueArc.style.strokeDashoffset = len;
+
+  const gauge = { target: 0, shown: 0, max, decimals, unit, valueArc, needle, readout, len, host };
+  instruments.push(gauge);
+  return gauge;
+}
+
+const instruments = [];
+
+function paintGauge(g) {
+  const frac = Math.max(0, Math.min(1, g.shown / g.max));
+  g.valueArc.style.strokeDashoffset = g.len * (1 - frac);
+  const deg = SWEEP_START + (SWEEP_END - SWEEP_START) * frac;
+  g.needle.setAttribute("transform", `rotate(${deg + 90} 66 66)`);
+  g.readout.innerHTML = g.shown.toFixed(g.decimals) + (g.unit ? `<i>${g.unit}</i>` : "");
+  g.host.dataset.live = g.shown > g.max * 0.02 ? "1" : "0";
+}
+
+/* One rAF loop drives every needle: ease toward target, plus a tremor small
+   enough to read as instrument noise rather than data. */
+function animateInstruments(now) {
+  for (const g of instruments) {
+    const tremor = g.target > 0 ? Math.sin(now / 420 + g.max) * g.max * 0.004 : 0;
+    g.shown += (g.target + tremor - g.shown) * 0.12;
+    if (Math.abs(g.shown) < 1e-4) g.shown = 0;
+    paintGauge(g);
+  }
+  requestAnimationFrame(animateInstruments);
+}
+
+/* ── oscilloscope ───────────────────────────────────────────────────────── */
+
+const scope = { history: new Array(160).fill(0), phase: 0 };
+
+function drawScope() {
+  const canvas = $("scope");
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 620, h = canvas.clientHeight || 104;
+  if (canvas.width !== Math.round(w * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const css = getComputedStyle(document.documentElement);
+  const blue = css.getPropertyValue("--blue").trim() || "#4f8ff7";
+  const edge = css.getPropertyValue("--edge").trim() || "#28313d";
+
+  ctx.strokeStyle = edge; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = (h / 4) * i;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  scope.phase = (scope.phase + 0.6) % 26;
+  for (let x = -scope.phase; x < w; x += 26) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  const peak = Math.max(12, ...scope.history);
+  const pts = scope.history.map((v, i) => [(i / (scope.history.length - 1)) * w, h - 6 - (v / peak) * (h - 14)]);
+
+  const fill = ctx.createLinearGradient(0, 0, 0, h);
+  fill.addColorStop(0, blue + "55"); fill.addColorStop(1, blue + "00");
+  ctx.beginPath(); ctx.moveTo(0, h);
+  pts.forEach(([x, y]) => ctx.lineTo(x, y));
+  ctx.lineTo(w, h); ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+
+  ctx.beginPath(); pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.strokeStyle = blue; ctx.lineWidth = 1.7; ctx.lineJoin = "round";
+  ctx.shadowColor = blue; ctx.shadowBlur = 9; ctx.stroke(); ctx.shadowBlur = 0;
+
+  const [hx, hy] = pts.at(-1);
+  ctx.beginPath(); ctx.arc(hx, hy, 3.1, 0, Math.PI * 2);
+  ctx.fillStyle = blue; ctx.shadowColor = blue; ctx.shadowBlur = 11; ctx.fill(); ctx.shadowBlur = 0;
+  requestAnimationFrame(drawScope);
+}
+
+/* ── demo sweep ─────────────────────────────────────────────────────────────
+   Drives the instruments through their range so they can be shown off with no
+   run in flight. Clearly labelled, and it restores real readings on release. */
+let sweeping = false;
+async function demoSweep() {
+  if (sweeping) return;
+  sweeping = true;
+  $("sweepBtn").dataset.on = "1";
+  $("scopeNote").textContent = "demo sweep";
+  const steps = [0.15, 0.55, 0.32, 0.88, 0.62, 1, 0.4, 0.08];
+  for (const k of steps) {
+    instruments.forEach((g) => (g.target = g.max * k));
+    scope.history.push(k * 60); scope.history.shift();
+    await new Promise((done) => setTimeout(done, 260));
+  }
+  sweeping = false;
+  $("sweepBtn").dataset.on = "0";
+  refreshInstruments();
+}
+
+/* ── tabs ───────────────────────────────────────────────────────────────── */
+
+function selectTab(name) {
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("is-active", t.dataset.tab === name));
+  document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("is-active", p.dataset.panel === name));
+  const active = document.querySelector(".tab.is-active");
+  const ink = $("tabInk"), tabs = document.querySelector(".tabs");
+  if (active && ink) {
+    ink.style.left = active.offsetLeft - tabs.scrollLeft + "px";
+    ink.style.width = active.offsetWidth + "px";
+  }
+  if (name === "transcript") $("tabDot").dataset.on = "0";
+  if (name === "answer") renderAnswer();
+  if (name === "transcript") renderStream(true);
+}
+
+function renderAnswer() {
+  const run = currentRun(), host = $("answer");
+  if (!run || !run.answer) {
+    host.innerHTML = '<div class="empty">the final answer of the selected run appears here</div>';
+    return;
+  }
+  host.textContent = run.answer;
+}
+
+/* Point the gauges at the current real readings (no-op while a demo sweep
+   owns them, so the sweep is not fought frame by frame). */
+function refreshInstruments() {
+  if (sweeping || !gTok) return;
+  const runs = state.order.map((id) => state.runs.get(id)).filter(Boolean);
+  const done = runs.filter((r) => r.status === "done");
+  const vram = (state.ollama.running || []).reduce((sum, m) => sum + (m.size_vram || 0), 0) / 1e9;
+  const firstPass = done.filter((r) => r.attempts <= 1 && r.source === "local").length;
+  const scores = runs.flatMap((r) => r.stages.map((x) => x.score)).filter((n) => n >= 1 && n <= 5);
+
+  gVram.target = vram;
+  gAccept.target = done.length ? (firstPass / done.length) * 100 : 0;
+  gJudge.target = scores.length ? scores.at(-1) : 0;
+  $("scopeNote").textContent = runs.some((r) => r.status === "running")
+    ? "streaming" : done.length ? `${done.length} runs` : "standby";
+}
+
 /* ── token rate ekg ─────────────────────────────────────────────────────── */
 
 function countChars(n) { state.charsWindow.push([performance.now(), n]); }
@@ -504,6 +692,10 @@ function tickRate() {
   const chars = state.charsWindow.reduce((sum, [, n]) => sum + n, 0);
   const tokens = Math.round(chars / 4);            // ~4 chars per token, close enough for a gauge
   tweenNum($("statRate"), tokens);
+
+  if (!sweeping && gTok) gTok.target = tokens;
+  scope.history.push(tokens);
+  scope.history.shift();
 
   state.rate.push(tokens);
   if (state.rate.length > 40) state.rate.shift();
@@ -541,8 +733,13 @@ function connect() {
       notifyForEvent(frame.data, run);
       if (frame.data.kind === "approval_requested") showApproval(run.pending_approval);
       if (frame.data.kind === "approval_resolved") $("approvalShade").hidden = true;
-      if (frame.data.kind === "token") { renderStream(); if (run.id === state.selected) renderGraph(); }
-      else renderAll();
+      if (frame.data.kind === "token") {
+        renderStream();
+        if (run.id === state.selected) renderGraph();
+        if (!document.querySelector('.panel[data-panel="transcript"]').classList.contains("is-active")) {
+          $("tabDot").dataset.on = "1";
+        }
+      } else renderAll();
     }
   };
 
@@ -568,8 +765,23 @@ const SUGGESTIONS = [
   "Summarise the README in five bullet points",
 ];
 
+let gTok = null, gVram = null, gAccept = null, gJudge = null;
+
 function init() {
   document.documentElement.dataset.theme = localStorage.getItem("theme") || "slate";
+
+  gTok    = makeGauge($("instTok"),    { label: "tokens / sec", max: 60,  decimals: 0 });
+  gVram   = makeGauge($("instVram"),   { label: "vram resident", unit: "GB", max: 24, decimals: 1 });
+  gAccept = makeGauge($("instAccept"), { label: "first-pass accept", unit: "%", max: 100, decimals: 0 });
+  gJudge  = makeGauge($("instJudge"),  { label: "last judge score", max: 5, decimals: 1, majors: 5 });
+  requestAnimationFrame(animateInstruments);
+  requestAnimationFrame(drawScope);
+
+  document.querySelectorAll(".tab").forEach((tab) =>
+    tab.addEventListener("click", () => selectTab(tab.dataset.tab)));
+  selectTab("dispatch");
+  window.addEventListener("resize", () => selectTab(document.querySelector(".tab.is-active").dataset.tab));
+  $("sweepBtn").addEventListener("click", demoSweep);
   $("themeToggle").addEventListener("click", () => {
     const next = document.documentElement.dataset.theme === "slate" ? "paper" : "slate";
     document.documentElement.dataset.theme = next;
@@ -587,6 +799,7 @@ function init() {
     if (!question) return;
     $("askInput").value = "";
     $("askBtn").disabled = true;
+    selectTab("transcript");
     setTimeout(() => ($("askBtn").disabled = false), 900);
     try {
       const response = await fetch("/api/ask", {
@@ -606,6 +819,11 @@ function init() {
 
   $("apvAllow").addEventListener("click", () => resolveApproval(true));
   $("apvDeny").addEventListener("click", () => resolveApproval(false));
+  // Escape denies rather than merely closing: leaving the modal without an
+  // answer would strand the run until the server's approval timeout.
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !$("approvalShade").hidden) resolveApproval(false);
+  });
 
   new ResizeObserver(layoutArc).observe($("graph"));
   window.addEventListener("resize", layoutArc);
