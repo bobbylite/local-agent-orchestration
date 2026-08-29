@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Quick Question — local-first Q&A with a Claude safety net.
 
-A router picks the best local Ollama model for the request. Every local
-worker can read/write files and search the web; if the default 7b worker's
-answer is rejected by the local judge (Prometheus-2), the retry is upgraded
-to a 14b worker. If the judge still isn't satisfied after two rounds, Claude
-Sonnet takes over. Every stage streams live and file writes always ask for
-permission first.
+A router picks the best local Ollama model for the request and decides what
+kind of request it is. Plain questions go to a single worker; "look this up
+and write me a file" requests are split in two — a research agent gathers
+current documentation with the web tools, then hands a written brief to a
+coder model that produces the file and nothing else.
+
+Either way the local judge (Prometheus-2) reviews the result; a rejected
+answer is retried once (upgraded to a 14b worker on the Q&A path), and if the
+judge still isn't satisfied Claude Sonnet takes over. Every stage streams live
+and file writes always ask for permission first.
 """
 
 import argparse
 import asyncio
 import contextvars
 import html
+import importlib.util
 import re
 import sys
 import time
@@ -64,6 +69,30 @@ ESCALATION_MODEL: Final[str] = "claude-sonnet-5"
 OLLAMA_URL: Final[str] = "http://localhost:11434"
 MAX_LOCAL_ATTEMPTS: Final[int] = 2
 
+# A "build" request — "get the latest docs on X and write me a sample script" —
+# takes the other branch of the graph: a research agent reads the docs on the
+# web and writes a brief, then a coder model turns that brief into a file. The
+# brief is the entire handoff, which is what keeps either half doing one job.
+#
+# The research stage doesn't hand the web tools to a model at all — see
+# QuestionPipeline.research for why — so its model only has to pick search
+# queries and write prose over what came back, which a small one does well and
+# leaves VRAM free. The coder never calls a tool either, so it can be the
+# strongest model installed.
+RESEARCH_MODEL: Final[str] = "hermes3:8b"
+CODER_MODEL: Final[str] = "qwen2.5:14b-instruct"
+# Summarizes a fetched page for whoever called read_url. Pinned to the research
+# model so that stage never swaps a second model into 12GB of VRAM mid-loop.
+READER_MODEL: Final[str] = RESEARCH_MODEL
+MAX_RESEARCH_QUERIES: Final[int] = 3
+MAX_RESEARCH_PAGES: Final[int] = 3
+# The brief rides in the coder's prompt, so it has to stay small enough to
+# leave room for the code the coder still has to write.
+MAX_BRIEF_CHARS: Final[int] = 6000
+
+ANSWER_PIPELINE: Final[list[str]] = ["route", "work", "judge", "escalate"]
+BUILD_PIPELINE: Final[list[str]] = ["route", "research", "code", "judge", "escalate"]
+
 # Exact absolute-grading prompt from https://github.com/prometheus-eval/prometheus-eval
 # (prometheus_eval/prompts.py) — Prometheus-2 was fine-tuned specifically on this format
 # and is unreliable with any other judging prompt shape.
@@ -97,6 +126,11 @@ Score 4: The response correctly and mostly completely addresses the request, wit
 Score 5: The response fully, accurately, and clearly satisfies the request with no meaningful issues."""
 JUDGE_ACCEPT_THRESHOLD: Final[int] = 4
 READ_URL_MAX_CHARS: Final[int] = 8000
+# Code a page shows is quoted straight through rather than summarized — see
+# _code_blocks. Two thousand characters is roughly a quickstart's worth, and
+# three pages of it still leaves the brief-writer room to think.
+MAX_CODE_BLOCKS: Final[int] = 5
+MAX_CODE_CHARS: Final[int] = 2000
 
 console: Final = Console()
 
@@ -118,6 +152,11 @@ def _pause_spinner() -> None:
 class Verdict(StrEnum):
     ACCEPT = "accept"
     RETRY = "retry"
+
+
+class TaskKind(StrEnum):
+    ANSWER = "answer"
+    BUILD = "build"
 
 
 class StageState(StrEnum):
@@ -197,6 +236,14 @@ async def write_file(path: str, content: str) -> str:
 
 _TAG_RE: Final = re.compile(r"<[^>]+>")
 _SCRIPT_STYLE_RE: Final = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_CHROME_RE: Final = re.compile(r"<(nav|header|footer|aside|form|svg)\b[^>]*>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_MAIN_RE: Final = re.compile(r"<(main|article)\b[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
+_BLOCK_TAG_RE: Final = re.compile(
+    r"</?(p|div|br|li|ul|ol|tr|table|h[1-6]|section|article|main|pre|blockquote|dt|dd)\b[^>]*>",
+    re.IGNORECASE,
+)
+_BLANK_RUN_RE: Final = re.compile(r"\n\s*\n(?:\s*\n)+")
+_PRE_RE: Final = re.compile(r"<pre\b[^>]*>(.*?)</pre>", re.DOTALL | re.IGNORECASE)
 _SEARCH_RESULT_RE: Final = re.compile(
     r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</a>',
     re.DOTALL,
@@ -206,6 +253,48 @@ _WEB_USER_AGENT: Final[str] = "Mozilla/5.0 (compatible; quick-question/1.0)"
 
 def _clean_html(fragment: str) -> str:
     return html.unescape(_TAG_RE.sub("", fragment)).strip()
+
+
+def _code_blocks(document: str) -> list[str]:
+    """Return the page's <pre> blocks verbatim, longest-lived problem first.
+
+    A summarizer paraphrases prose well and destroys code: asked for the gist of
+    a quickstart it returns "the tutorial shows how to define a graph" and drops
+    the import lines, which are the only part the coder downstream actually
+    needs. The docs carry the real thing — langchain's agent-workflow page has
+    19 <pre> blocks of current API — so it is copied across untouched instead.
+    """
+    blocks: list[str] = []
+    seen: set[str] = set()
+    for raw in _PRE_RE.findall(_SCRIPT_STYLE_RE.sub("", document)):
+        block = _clean_html(raw)
+        if len(block) < 20 or block in seen:
+            continue
+        seen.add(block)
+        blocks.append(block)
+        if len(blocks) >= MAX_CODE_BLOCKS:
+            break
+    return blocks
+
+
+def _page_text(document: str) -> str:
+    """Reduce a fetched HTML page to the text worth spending context on.
+
+    Naively stripping tags spends the whole character budget before reaching any
+    content: a docs page is mostly nav, and the blank lines left behind by its
+    layout tags are counted too — on realpython.com and pypi.org the first 8000
+    characters were *entirely* chrome and whitespace, so the summarizer never
+    saw the documentation it was pointed at. Dropping the chrome, preferring the
+    <main>/<article> region, and collapsing blank runs makes the same budget buy
+    the actual prose and code.
+    """
+    body = _CHROME_RE.sub("", _SCRIPT_STYLE_RE.sub("", document))
+    main = _MAIN_RE.search(body)
+    if main:
+        body = main.group(2)
+    text = _clean_html(_BLOCK_TAG_RE.sub("\n", body))
+    text = re.sub(r"[ \t\xa0]+", " ", text)
+    return _BLANK_RUN_RE.sub("\n\n", text).strip()
 
 
 def _resolve_ddg_url(href: str) -> str:
@@ -220,30 +309,49 @@ def _resolve_ddg_url(href: str) -> str:
     return href
 
 
-@tool
-def web_search(query: str, max_results: int = 5) -> str:
-    """Search the public web (via DuckDuckGo) and return titles, URLs, and snippets."""
+@dataclass(frozen=True, slots=True)
+class SearchHit:
+    url: str
+    title: str
+    snippet: str
+
+
+def search_web(query: str, max_results: int = 5) -> list[SearchHit]:
+    """Run one search and return it as data. Raises httpx.HTTPError.
+
+    Split out of the `web_search` tool so the research stage can drive a search
+    itself and get URLs back, rather than parsing them out of the prose the tool
+    hands a model. Both callers go through here, so both are announced the same
+    way in the terminal and on the dashboard.
+    """
     _pause_spinner()
     console.print(f"[cyan]🔧 web_search[/cyan] [dim]{query}[/dim]")
     events.emit(events.Kind.TOOL_CALL, tool="web_search", detail=query)
+    resp = httpx.get(
+        "https://html.duckduckgo.com/html/",
+        params={"q": query},
+        headers={"User-Agent": _WEB_USER_AGENT},
+        timeout=10.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    return [
+        SearchHit(url=_resolve_ddg_url(href), title=_clean_html(title), snippet=_clean_html(snippet))
+        for href, title, snippet in _SEARCH_RESULT_RE.findall(resp.text)[:max_results]
+    ]
+
+
+@tool
+def web_search(query: str, max_results: int = 5) -> str:
+    """Search the public web (via DuckDuckGo) and return titles, URLs, and snippets."""
     try:
-        resp = httpx.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers={"User-Agent": _WEB_USER_AGENT},
-            timeout=10.0,
-            follow_redirects=True,
-        )
-        resp.raise_for_status()
+        hits = search_web(query, max_results)
     except httpx.HTTPError as exc:
         return f"ERROR searching web: {exc}"
-
-    matches = _SEARCH_RESULT_RE.findall(resp.text)[:max_results]
-    if not matches:
+    if not hits:
         return "No results found."
     return "\n\n".join(
-        f"{i}. {_clean_html(title)}\n{_resolve_ddg_url(href)}\n{_clean_html(snippet)}"
-        for i, (href, title, snippet) in enumerate(matches, start=1)
+        f"{i}. {hit.title}\n{hit.url}\n{hit.snippet}" for i, hit in enumerate(hits, start=1)
     )
 
 
@@ -257,6 +365,8 @@ async def read_url(url: str, question: str = "") -> str:
     _pause_spinner()
     console.print(f"[cyan]🔧 read_url[/cyan] [dim]{url}[/dim]")
     events.emit(events.Kind.TOOL_CALL, tool="read_url", detail=url)
+    if not url.strip():
+        return "ERROR: read_url needs a url. Call web_search first and pass one of its results."
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
             resp = await client.get(url, headers={"User-Agent": _WEB_USER_AGENT})
@@ -264,17 +374,25 @@ async def read_url(url: str, question: str = "") -> str:
     except httpx.HTTPError as exc:
         return f"ERROR fetching {url}: {exc}"
 
-    text = _clean_html(_SCRIPT_STYLE_RE.sub("", resp.text))[:READ_URL_MAX_CHARS]
+    text = _page_text(resp.text)[:READ_URL_MAX_CHARS]
     if not text:
         return f"ERROR: no readable text found at {url}"
 
     focus = f" Focus especially on anything relevant to: {question}" if question else ""
-    console.print(f"[dim]… reader agent ({DEFAULT_WORKER_MODEL}) is summarizing the page[/dim]")
-    reader_model = ChatOllama(model=DEFAULT_WORKER_MODEL, base_url=OLLAMA_URL)
+    console.print(f"[dim]… reader agent ({READER_MODEL}) is summarizing the page[/dim]")
+    reader_model = ChatOllama(model=READER_MODEL, base_url=OLLAMA_URL)
     summary = await reader_model.ainvoke(
-        f"Read the following webpage content and write a concise, factual summary of it.{focus}\n\n{text}"
+        "Read the following webpage content and write a concise, factual summary of it."
+        f"{focus} Copy any package names, import lines, function and class names and arguments "
+        "across exactly as they appear — never paraphrase or guess at code, since whoever reads "
+        "this summary cannot see the page.\n\n"
+        f"{text}"
     )
-    return f"Summary of {url}:\n{extract_text(summary)}"
+    report = f"Summary of {url}:\n{extract_text(summary)}"
+    code = "\n\n".join(_code_blocks(resp.text))[:MAX_CODE_CHARS]
+    if code:
+        report += f"\n\nCode shown on {url}, copied verbatim:\n\n{code}"
+    return report
 
 
 TOOLS: Final[list[BaseTool]] = [read_file, write_file, web_search, read_url]
@@ -366,6 +484,34 @@ async def run_agent_stage(
 
 
 _ROUTE_RE: Final = re.compile(r"MODEL:\s*([A-Za-z0-9_.:\-]+)", re.IGNORECASE)
+_TASK_RE: Final = re.compile(r"TASK:\s*(answer|build)", re.IGNORECASE)
+_BUILD_VERB_RE: Final = re.compile(r"\b(write|create|build|make|generate|scaffold|implement|code)\b", re.IGNORECASE)
+_BUILD_NOUN_RE: Final = re.compile(
+    r"(\b(script|file|program|agent|app|module|package|class|function|cli|demo|sample|example|snippet|notebook)\b|\S+\.py\b)",
+    re.IGNORECASE,
+)
+_CODE_BLOCK_RE: Final = re.compile(r"```[a-zA-Z0-9+#-]*\n(.*?)```", re.DOTALL)
+_EXPLICIT_PATH_RE: Final = re.compile(r"[\w./~-]*\w\.py\b")
+_QUERY_RE: Final = re.compile(r"^\s*(?:[-*\d.)\s]*)QUERY:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+# Read the source before the commentary: a docs host or package index states the
+# current API, where a tutorial repeats whichever version it was written against.
+# Repositories sit between the two — the project's own is as good as its docs,
+# but a search for a popular library returns a long tail of strangers' example
+# repos under the same host, and those are worth less than any real docs page.
+_DOCS_HOST_RE: Final = re.compile(
+    r"//([\w.-]*\b(docs?|documentation|readthedocs)\b[\w.-]*|pypi\.org)/|/(docs|reference|api)/",
+    re.IGNORECASE,
+)
+_REPO_HOST_RE: Final = re.compile(r"//([\w.-]*\.)?(github\.com|gitlab\.com|sourceforge\.net)/", re.IGNORECASE)
+# Phrasing words that say how the user asked rather than what they asked about;
+# dropping them turns "get the latest docs on langgraph and create a sample
+# python agent for me" into langgraph_agent.py instead of get_the_latest.py.
+_SLUG_STOPWORDS: Final[frozenset[str]] = frozenset(
+    """a an and the of for to in on with using use me my please can you get find look up latest
+    newest current docs doc documentation reference read then after that create make build write
+    generate scaffold implement code sample example simple basic minimal small quick new file
+    script program python py agent app""".split()
+)
 # Same pattern prometheus-eval's own parser uses (prometheus_eval/parser.py),
 # tolerant of "[RESULT] N", "Score: N", "N out of 5", "N/5", etc.
 _JUDGE_RESULT_RE: Final = re.compile(
@@ -385,6 +531,88 @@ def parse_route(text: str) -> str:
             if candidate.lower() == tag.lower():
                 return tag
     return DEFAULT_WORKER_MODEL
+
+
+def guess_task(request: str) -> TaskKind:
+    """Classify a request without asking a model.
+
+    Used as the fallback when the router omits or mangles its TASK line, which
+    a 12b model does often enough to matter. A build request is a verb that
+    produces an artifact plus a noun that names one.
+    """
+    return (
+        TaskKind.BUILD
+        if _BUILD_VERB_RE.search(request) and _BUILD_NOUN_RE.search(request)
+        else TaskKind.ANSWER
+    )
+
+
+def parse_task(text: str, request: str) -> TaskKind:
+    last = None
+    for last in _TASK_RE.finditer(text):
+        pass
+    return TaskKind(last.group(1).lower()) if last else guess_task(request)
+
+
+def _shadows_installed_module(stem: str) -> bool:
+    """True if importing `stem` today would find something other than this file.
+
+    Writing `langgraph.py` into the working directory shadows the installed
+    `langgraph` package for every later run in this project, so the coder's
+    output gets renamed out of the way when the name collides. A module already
+    sitting in the working directory is this tool's own earlier output, not a
+    collision, so it doesn't count.
+    """
+    if not stem.isidentifier():
+        return False
+    try:
+        spec = importlib.util.find_spec(stem)
+    except (ImportError, ValueError):
+        return False
+    if spec is None:
+        return False
+    if spec.origin is None:  # namespace package — no file to compare against
+        return True
+    return Path(spec.origin).resolve().parent != Path.cwd().resolve()
+
+
+def slugify_request(request: str) -> str:
+    """Name a file after what the request is *about*, not how it was phrased."""
+    words = [w for w in re.findall(r"[a-zA-Z0-9]+", request.lower()) if w not in _SLUG_STOPWORDS]
+    return "_".join(words[:3]) or "generated_agent"
+
+
+def output_path_for(request: str) -> Path:
+    """Pick where the coder's file goes, honouring a filename named in the request."""
+    named = _EXPLICIT_PATH_RE.search(request)
+    path = Path(named.group(0)).expanduser() if named else Path(f"{slugify_request(request)}.py")
+    if path.suffix == ".py" and _shadows_installed_module(path.stem):
+        path = path.with_name(f"{path.stem}_agent.py")
+    return path
+
+
+def parse_queries(text: str, request: str) -> list[str]:
+    """Pull the planner's QUERY: lines out, falling back to the request itself."""
+    queries = [q.strip() for q in _QUERY_RE.findall(text) if q.strip()]
+    return queries[:MAX_RESEARCH_QUERIES] or [request]
+
+
+def rank_hits(hits: Sequence[SearchHit]) -> list[SearchHit]:
+    """Order search results so a project's own docs are read before write-ups about them."""
+
+    def tier(url: str) -> int:
+        if _DOCS_HOST_RE.search(url):
+            return 0
+        return 1 if _REPO_HOST_RE.search(url) else 2
+
+    return sorted(hits, key=lambda hit: (tier(hit.url), hit.url))
+
+
+def extract_code(text: str) -> str:
+    """Pull the code out of a coder reply, fenced or not, keeping the longest block."""
+    blocks = _CODE_BLOCK_RE.findall(text)
+    body = max(blocks, key=len) if blocks else text
+    return body.strip() + "\n"
 
 
 def parse_verdict(text: str) -> tuple[Verdict, str, int | None]:
@@ -412,7 +640,10 @@ class QAState(TypedDict):
     # overwrite placeholders as the graph progresses, rather than introducing
     # keys that show up partway through.
     request: str
+    task: TaskKind
     worker_model: str
+    brief: str
+    path: str
     answer: str
     feedback: str
     attempts: int
@@ -421,6 +652,18 @@ class QAState(TypedDict):
 
 
 class RouteUpdate(TypedDict):
+    worker_model: str
+    task: TaskKind
+
+
+class ResearchUpdate(TypedDict):
+    brief: str
+
+
+class CodeUpdate(TypedDict):
+    answer: str
+    attempts: int
+    path: str
     worker_model: str
 
 
@@ -469,20 +712,155 @@ class QuestionPipeline:
     async def route(self, state: QAState) -> RouteUpdate:
         self.trail.append(TrailStep("Router", StageState.RUNNING))
         options = "\n".join(f"- {tag}: best for {desc}" for tag, desc in WORKER_MODELS.items())
-        prompt = f"""Choose the single best local model to answer this request.
+        prompt = f"""Choose the single best local model for this request, and say what kind of request it is.
 
 {self._context_block()}Request: {state['request']}
 
-Options:
+Model options:
 {options}
 
-In one short sentence, explain your choice. Then on its own final line, output exactly:
-MODEL: <tag>"""
+Request kinds:
+- build: the user wants code written to a file — a script, a program, a sample agent — whether or not
+  it also needs looking something up first
+- answer: everything else, including questions about code
+
+In one short sentence, explain your choices. Then output exactly these two final lines:
+MODEL: <tag>
+TASK: <build|answer>"""
         text = await run_text_stage("🧭  Orchestrating", "Choosing a worker model", self.router_model, prompt, stage="route")
         chosen = parse_route(text)
+        task = parse_task(text, state["request"])
+        pipeline = BUILD_PIPELINE if task is TaskKind.BUILD else ANSWER_PIPELINE
         self.trail[-1] = TrailStep("Router", StageState.OK)
-        events.emit(events.Kind.STAGE_FINISHED, stage="route", chose=chosen)
-        return {"worker_model": chosen}
+        events.emit(events.Kind.STAGE_FINISHED, stage="route", chose=chosen, task=str(task), pipeline=pipeline)
+        return {"worker_model": chosen, "task": task}
+
+    async def research(self, state: QAState) -> ResearchUpdate:
+        """Read the current docs on the web and write the brief the coder builds from.
+
+        The searching and the page reads are driven from here rather than by
+        handing the web tools to an agent, because a local model asked to chain
+        web_search → read_url does it only sometimes: qwen2.5:14b-instruct never
+        emitted a usable tool_call under this stage's prompt at all, and
+        hermes3:8b — the best caller installed — searched but skipped reading any
+        page on one run out of two, then briefed from search snippets and made
+        the API up. Skipping the docs is the one thing this stage exists to
+        prevent, so the model only chooses the queries and writes the prose; the
+        pipeline guarantees the reading happened.
+        """
+        self.trail.append(TrailStep("Research", StageState.RUNNING))
+        research_model = ChatOllama(model=RESEARCH_MODEL, base_url=OLLAMA_URL)
+
+        plan = await run_text_stage(
+            f"🔎  Research · {RESEARCH_MODEL}", "Planning searches", research_model,
+            f"""{self._context_block()}A programmer needs current documentation to satisfy this request:
+
+{state['request']}
+
+Write up to {MAX_RESEARCH_QUERIES} web search queries that would find it — the official docs or
+package page for whatever library or tool is involved, and how to use it. Keep each query short and
+specific, the way you would actually type it into a search engine. Output nothing but the queries,
+one per line, each prefixed with "QUERY: ".""",
+            stage="research",
+        )
+        queries = parse_queries(plan, state["request"])
+
+        hits: dict[str, SearchHit] = {}
+        for query in queries:
+            try:
+                for hit in search_web(query, max_results=4):
+                    hits.setdefault(hit.url, hit)
+            except httpx.HTTPError as exc:
+                console.print(f"[yellow]search failed for {query!r}: {exc}[/yellow]")
+
+        pages: list[str] = []
+        for hit in rank_hits(list(hits.values()))[:MAX_RESEARCH_PAGES]:
+            summary = await read_url.ainvoke({"url": hit.url, "question": state["request"]})
+            if not summary.startswith("ERROR"):
+                pages.append(summary)
+
+        if not pages:
+            self.trail[-1] = TrailStep("Research", StageState.FAILED)
+            console.print("[yellow]No pages could be read — the coder will work from memory.[/yellow]\n")
+            return {"brief": ""}
+
+        sources = "\n\n".join(pages)
+        brief = await run_text_stage(
+            f"🔎  Research · {RESEARCH_MODEL}", "Writing the brief", research_model,
+            [
+                SystemMessage(
+                    "You are writing a briefing for a programmer who will write the code and cannot "
+                    "search the web. Work only from the page summaries you are given — they are "
+                    "newer than your training data, and anything you add from memory is the stale "
+                    "version this stage exists to replace. Cover: the exact package name to install, "
+                    "the exact import lines, the API surface (classes, functions, their arguments) "
+                    "with any version caveats, one short idiomatic example, and the source URLs. If "
+                    "the summaries don't establish something, say so instead of filling it in. Write "
+                    "only the briefing — someone else writes the program."
+                ),
+                HumanMessage(f"Request: {state['request']}\n\nPage summaries:\n\n{sources}"),
+            ],
+            stage="research",
+        )
+        self.trail[-1] = TrailStep("Research", StageState.OK)
+        return {"brief": brief[:MAX_BRIEF_CHARS]}
+
+    async def code(self, state: QAState) -> CodeUpdate:
+        """Turn the research brief into a file. Streams the code, then asks to write it.
+
+        The write is done by this node rather than by a tool call inside an agent
+        loop: the local coder models emit tool_calls unreliably, and a build
+        request that silently ends without a file is the one failure mode worth
+        engineering out. The user still approves it through the same path.
+        """
+        attempts = state["attempts"] + 1
+        path = Path(state["path"]) if state["path"] else output_path_for(state["request"])
+        self.trail.append(TrailStep(f"Coder · {CODER_MODEL} ({attempts}/{MAX_LOCAL_ATTEMPTS})", StageState.RUNNING))
+        # The brief goes in the system message rather than the user turn: buried
+        # in the prompt body the coder skims it and falls back on the API it
+        # remembers, which for a fast-moving library is the wrong one.
+        system = SystemMessage(
+            "You are a coder. You write one file and nothing else — no prose, no explanation, no "
+            "commentary. Output a single ```python block containing the complete file: runnable, "
+            "self-contained, with every import it needs and a short module docstring."
+            + (
+                "\n\nA research agent read the current documentation for you and left this briefing. "
+                "It is newer than your training data, so it wins over anything you remember. Do not "
+                "import, call, or reference any name that does not appear in it; if the briefing "
+                "does not cover something you need, keep that part minimal rather than inventing an "
+                f"API for it.\n\n{state['brief']}"
+                if state["brief"]
+                else ""
+            )
+        )
+        feedback = f"""
+
+A reviewer rejected your previous attempt for this reason: {state['feedback']}
+Fix it.""" if state["feedback"] else ""
+        prompt = f"""{self._context_block()}Request: {state['request']}{feedback}
+
+Write the complete contents of `{path}`."""
+        coder_model = ChatOllama(model=CODER_MODEL, base_url=OLLAMA_URL)
+        events.emit(events.Kind.STAGE_STARTED, stage="code", model=CODER_MODEL, attempt=attempts)
+        raw = await run_text_stage(
+            f"💻  Coder · {CODER_MODEL}", f"Writing {path}", coder_model,
+            [system, HumanMessage(prompt)], stage="code",
+        )
+        code_text = extract_code(raw)
+        if not code_text.strip():
+            self.trail[-1] = TrailStep(self.trail[-1].label, StageState.FAILED)
+            return {
+                "answer": "The coder model returned no code.",
+                "attempts": attempts, "path": str(path), "worker_model": CODER_MODEL,
+            }
+        result = await write_file.ainvoke({"path": str(path), "content": code_text})
+        self.trail[-1] = TrailStep(self.trail[-1].label, StageState.OK)
+        return {
+            "answer": f"{result}\n\n```python\n{code_text}```",
+            "attempts": attempts,
+            "path": str(path),
+            "worker_model": CODER_MODEL,
+        }
 
     async def work(self, state: QAState) -> WorkUpdate:
         model_tag = state["worker_model"]
@@ -543,7 +921,15 @@ MODEL: <tag>"""
             "Only call write_file if the request requires creating or modifying a file; "
             "the user must approve every write. Two local model attempts failed review; answer directly and well."
         )
-        human_text = f"{self._context_block()}{state['request']}\n\n(Local model feedback from the last attempt: {state['feedback']})"
+        human_text = f"{self._context_block()}{state['request']}"
+        if state["brief"]:
+            human_text += (
+                f"\n\nA research agent read the current docs and produced this briefing "
+                f"(treat it as a lead, not as gospel):\n{state['brief']}"
+            )
+        if state["task"] is TaskKind.BUILD and state["path"]:
+            human_text += f"\n\nWrite the file to {state['path']}."
+        human_text += f"\n\n(Local model feedback from the last attempt: {state['feedback']})"
         answer = await run_agent_stage(
             f"🚀  Escalate · {ESCALATION_MODEL}", "Claude is taking over", self.claude_model,
             [system, HumanMessage(human_text)], stage="escalate",
@@ -553,23 +939,36 @@ MODEL: <tag>"""
         return {"answer": answer, "final_source": FinalSource.CLAUDE}
 
     @staticmethod
+    def after_route(state: QAState) -> str:
+        return "research" if state["task"] is TaskKind.BUILD else "work"
+
+    @staticmethod
     def after_judge(state: QAState) -> str:
         if state["verdict"] is Verdict.ACCEPT:
             return "end"
         if state["attempts"] >= MAX_LOCAL_ATTEMPTS:
             return "escalate"
-        return "retry"
+        # A build retry goes back to the coder, not the researcher: the brief is
+        # still good, it was the code the judge didn't like.
+        return "retry_code" if state["task"] is TaskKind.BUILD else "retry_work"
 
     def build_graph(self) -> CompiledStateGraph:
         graph = StateGraph(QAState)
         graph.add_node("route", self.route)
         graph.add_node("work", self.work)
+        graph.add_node("research", self.research)
+        graph.add_node("code", self.code)
         graph.add_node("judge", self.judge)
         graph.add_node("escalate", self.escalate)
         graph.add_edge(START, "route")
-        graph.add_edge("route", "work")
+        graph.add_conditional_edges("route", self.after_route, {"work": "work", "research": "research"})
+        graph.add_edge("research", "code")
+        graph.add_edge("code", "judge")
         graph.add_edge("work", "judge")
-        graph.add_conditional_edges("judge", self.after_judge, {"end": END, "retry": "work", "escalate": "escalate"})
+        graph.add_conditional_edges(
+            "judge", self.after_judge,
+            {"end": END, "retry_work": "work", "retry_code": "code", "escalate": "escalate"},
+        )
         graph.add_edge("escalate", END)
         return graph.compile()
 
@@ -581,13 +980,18 @@ async def run_pipeline(request: str, history: Sequence[tuple[str, str]] = ()) ->
     failures propagate so each front end can present them its own way.
     """
     started = time.monotonic()
-    events.new_run(request, tool="quick_question", pipeline=["route", "work", "judge", "escalate"])
+    # The pipeline is provisional: `route` re-announces it as BUILD_PIPELINE if
+    # the request turns out to want a file written.
+    events.new_run(request, tool="quick_question", pipeline=ANSWER_PIPELINE)
 
     pipeline = QuestionPipeline.create(history)
     app = pipeline.build_graph()
     initial_state: QAState = {
         "request": request,
+        "task": TaskKind.ANSWER,
         "worker_model": "",
+        "brief": "",
+        "path": "",
         "answer": "",
         "feedback": "",
         "attempts": 0,
@@ -610,7 +1014,9 @@ async def answer_question(request: str, history: Sequence[tuple[str, str]] = ())
     started = time.monotonic()
     console.print(
         Panel.fit(
-            f"[bold]{request}[/bold]\n[dim]{DEFAULT_WORKER_MODEL} Orchestrator → local worker → {JUDGE_MODEL} judge (×{MAX_LOCAL_ATTEMPTS}) → {ESCALATION_MODEL}[/dim]",
+            f"[bold]{request}[/bold]\n[dim]{ROUTER_MODEL} Orchestrator → local worker "
+            f"(or {RESEARCH_MODEL} research → {CODER_MODEL} coder) → {JUDGE_MODEL} judge "
+            f"(×{MAX_LOCAL_ATTEMPTS}) → {ESCALATION_MODEL}[/dim]",
             title="❓ Quick Question",
             border_style="blue",
         )

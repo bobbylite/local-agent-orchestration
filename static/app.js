@@ -11,8 +11,8 @@
 const $ = (id) => document.getElementById(id);
 
 const STAGE_LABEL = {
-  route: "Route", work: "Worker", judge: "Judge", escalate: "Escalate",
-  architect: "Architect", builder: "Builder",
+  route: "Route", work: "Worker", research: "Research", code: "Coder",
+  judge: "Judge", escalate: "Escalate", architect: "Architect", builder: "Builder",
 };
 const DEFAULT_PIPELINE = ["route", "work", "judge", "escalate"];
 const TOAST_LIMIT = 5;
@@ -56,6 +56,10 @@ function applyEvent(frame) {
   const name = payload.stage || "";
   let stage = activeStage(run, name);
 
+  // Mirrors Hub.apply: the router re-announces the pipeline once it knows
+  // whether this run answers a question or builds a file.
+  if (payload.pipeline) run.pipeline = payload.pipeline;
+
   switch (kind) {
     case "run_started":
       Object.assign(run, {
@@ -72,7 +76,7 @@ function applyEvent(frame) {
       if (payload.title) stage.title = payload.title;
       if (payload.model) stage.model = payload.model;
       if (payload.attempt != null) { stage.attempt = payload.attempt; run.attempts = Math.max(run.attempts, payload.attempt); }
-      if (stage.model && name === "work") run.worker_model = stage.model;
+      if (stage.model && (name === "work" || name === "code")) run.worker_model = stage.model;
       break;
     case "token":
       if (stage) { stage.text += payload.text || ""; countChars((payload.text || "").length); }
@@ -149,7 +153,7 @@ function notifyForEvent(frame, run) {
     case "run_started":
       toast("info", "Run dispatched" + where, p.request); break;
     case "stage_started":
-      if (p.stage === "work" && p.attempt > 1) toast("warn", `Retrying on ${p.model}`, `attempt ${p.attempt}`);
+      if ((p.stage === "work" || p.stage === "code") && p.attempt > 1) toast("warn", `Retrying on ${p.model}`, `attempt ${p.attempt}`);
       else if (p.stage === "escalate") toast("warn", "Escalating to Claude", "local attempts exhausted");
       else if (p.model) toast("muted", `${STAGE_LABEL[p.stage] || p.stage} started`, p.model);
       break;
@@ -249,7 +253,7 @@ function renderConfig() {
   if (!c.router) return;
   $("config").innerHTML = [
     ["router", c.router], ["default worker", c.default_worker], ["retry worker", c.bump_worker],
-    ["judge", c.judge], ["escalation", c.escalation],
+    ["research", c.research], ["coder", c.coder], ["judge", c.judge], ["escalation", c.escalation],
     ["local attempts", c.max_attempts], ["accept at", `≥ ${c.accept_threshold}/5`],
   ].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(String(v))}</dd>`).join("");
 }
@@ -283,7 +287,7 @@ function renderGraph() {
       </div></div>`;
   }).join("");
 
-  const retrying = run ? run.stages.filter((s) => s.name === "work").length > 1 : false;
+  const retrying = run ? run.stages.filter((s) => s.name === "work" || s.name === "code").length > 1 : false;
   $("graph").dataset.retry = retrying ? "1" : "0";
   $("graphStatus").textContent = !run ? "idle"
     : run.status === "running" ? `running · ${run.request.slice(0, 42)}`
@@ -293,19 +297,21 @@ function renderGraph() {
 
 function defaultModelFor(name) {
   const c = state.config;
-  return { route: c.router, work: c.default_worker, judge: c.judge, escalate: c.escalation }[name] || "";
+  return { route: c.router, work: c.default_worker, research: c.research, code: c.coder,
+           judge: c.judge, escalate: c.escalation }[name] || "";
 }
 
 /* The retry edge is drawn under the row, measured from the live node boxes so it
    stays glued to them through every reflow. */
 function layoutArc() {
   const graph = $("graph"), svg = $("graphArc");
-  const work = graph.querySelector('.node[data-stage="work"]');
+  // The judge's retry edge points back at whichever node produced the answer.
+  const worker = graph.querySelector('.node[data-stage="work"]') || graph.querySelector('.node[data-stage="code"]');
   const judge = graph.querySelector('.node[data-stage="judge"]');
-  if (!work || !judge) { $("arcPath").removeAttribute("d"); $("arcFlow").removeAttribute("d"); return; }
+  if (!worker || !judge) { $("arcPath").removeAttribute("d"); $("arcFlow").removeAttribute("d"); return; }
 
   const base = graph.getBoundingClientRect();
-  const a = judge.getBoundingClientRect(), b = work.getBoundingClientRect();
+  const a = judge.getBoundingClientRect(), b = worker.getBoundingClientRect();
   svg.setAttribute("viewBox", `0 0 ${base.width} ${base.height}`);
   const x1 = a.left + a.width / 2 - base.left, x2 = b.left + b.width / 2 - base.left;
   const y = a.bottom - base.top, dip = base.height - 6;

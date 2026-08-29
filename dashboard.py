@@ -185,6 +185,12 @@ class Hub:
         stage_name = str(payload.get("stage") or "")
         kind = event.kind
 
+        # The pipeline isn't known at run_started: quick_question's router picks
+        # between the Q&A and build branches and re-announces it, so any event
+        # carrying one wins.
+        if payload.get("pipeline"):
+            run.pipeline = list(payload["pipeline"])
+
         if kind is events.Kind.RUN_STARTED:
             run.request = str(payload.get("request", ""))
             run.tool = str(payload.get("tool", "quick_question"))
@@ -279,6 +285,8 @@ class Hub:
                 "default_worker": qq.DEFAULT_WORKER_MODEL,
                 "bump_worker": qq.BUMP_WORKER_MODEL,
                 "router": qq.ROUTER_MODEL,
+                "research": qq.RESEARCH_MODEL,
+                "coder": qq.CODER_MODEL,
                 "judge": qq.JUDGE_MODEL,
                 "escalation": qq.ESCALATION_MODEL,
                 "max_attempts": qq.MAX_LOCAL_ATTEMPTS,
